@@ -2833,8 +2833,10 @@ class MaxTextConfig(
           raise ValueError("use_te_ep=True requires sparse_matmul=True.")
         if "gpu" not in self.hardware:
           raise ValueError("use_te_ep=True is only supported on GPU hardware for v1.")
-        if self.dcn_expert_parallelism != 1:
-          raise ValueError("use_te_ep=True requires dcn_expert_parallelism == 1 for v1.")
+        # dcn_expert_parallelism > 1 was rejected under v1 (single-NVLink-domain only).
+        # The mesh-level "expert" axis composes ICI × DCN EP into a single dimension,
+        # so the te_ep_init bootstrap sees the combined ep_size automatically. Whether
+        # TE EP's NCCL transport actually supports cross-node EP is container-dependent.
         if self.ici_expert_parallelism < 4:
           raise ValueError("use_te_ep=True requires ici_expert_parallelism >= 4 for v1.")
         if self.num_experts % self.ici_expert_parallelism != 0:
