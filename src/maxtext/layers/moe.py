@@ -1973,8 +1973,11 @@ class RoutedMoE(nnx.Module):
             padding_headroom = int(self.num_experts * (align_size - 1))
             reverse_buffer_size = original_inputs_first_dim + padding_headroom
 
-          if perm_state.sorted_selected_experts.shape[0] != original_inputs_first_dim:
-            raise ValueError("original_inputs_first_dim does not match the original tensor" " shape!")
+          #if perm_state.sorted_selected_experts.shape[0] != original_inputs_first_dim:
+          # Bug fix
+          if perm_state.sorted_selected_experts.shape[0] != reverse_buffer_size:
+            # raise ValueError("original_inputs_first_dim does not match the original tensor" " shape!")
+            raise ValueError(f"reverse buffer size {reverse_buffer_size} does not match the original tensor shape {perm_state.sorted_selected_experts.shape[0]}!")
           output_shape = jax.lax.empty(
               (
                   reverse_buffer_size,
