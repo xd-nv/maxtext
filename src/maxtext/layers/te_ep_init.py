@@ -334,24 +334,19 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   from transformer_engine.jax.sharding import global_shard_guard  # pylint: disable=import-outside-toplevel
 
   with mesh, jax.set_mesh(mesh), global_shard_guard(candidate.mesh_resource):
-    # Latest TE EP renamed em_unfused_num_sms -> max_num_permute_sms.
-    # allow_handle_mem_reloc=True is required when XLA's CUSTOM_CALL is in the
-    # command_buffer scope: XLA reallocates the EP handle_mem between captures
-    # and TE EP's get_or_open_handle() asserts unless reloc is allowed. Empirically
-    # both DSV3 671B at 20L (job 1924032, old formula) and 61L (job 1925466,
-    # new (NLE+1)*slots formula) hit the assertion without it — buffer size does
-    # not eliminate the reloc, only allowing it does.
+    # TE EP branch pr-3036 signature: ep_size is derived internally from the
+    # mesh (MeshResource.ep_resource, set in _build_mesh_resource), so it is no
+    # longer passed explicitly. That branch also dropped the separate
+    # max_num_permute_sms knob (only max_num_sms remains) and the
+    # allow_handle_mem_reloc flag.
     ep_bootstrap(
         world_size=world_size,
         rank=rank,
-        ep_size=candidate.ep_size,
         num_experts=candidate.num_experts,
         max_tokens_per_rank=candidate.max_tokens_per_rank,
         recv_capacity_per_rank=candidate.recv_capacity_per_rank,
         hidden_dim=candidate.hidden_dim,
         max_num_sms=candidate.max_num_sms,
-        max_num_permute_sms=candidate.em_unfused_num_sms,
-        allow_handle_mem_reloc=True,
     )
 
   _TE_EP_STATE = candidate

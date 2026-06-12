@@ -2049,12 +2049,12 @@ class RoutedMoE(nnx.Module):
       if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
         raise NotImplementedError(
             "use_te_ep=True is not implemented for LLAMA4's pre-weighted routing path. "
-            "TE EP applies routing weights inside ep_combine; combining with LLAMA4's "
-            "pre-multiply would double-apply."
+            "This path pre-multiplies routing weights before ep_combine (pr-3036 "
+            "ep_combine is unweighted); combining with LLAMA4's pre-multiply would double-apply."
         )
 
       from maxtext.layers import te_ep_init  # pylint: disable=import-outside-toplevel
-      from transformer_engine.jax.ep import ep_combine, ep_dispatch  # pylint: disable=import-outside-toplevel
+      from transformer_engine.jax.ep import EpLayerConfig, ep_combine, ep_dispatch  # pylint: disable=import-outside-toplevel
 
       state = te_ep_init.get_te_ep_state()
       batch_size, sequence_length, _ = x.shape
@@ -2087,12 +2087,21 @@ class RoutedMoE(nnx.Module):
       top_k_indices_2d = jax.lax.with_sharding_constraint(top_k_indices_2d, input_sharding)
       weights_2d = jax.lax.with_sharding_constraint(weights_2d, input_sharding)
 
+      # pr-3036 threads a per-layer EpLayerConfig (top_k + the old
+      # dispatch_alignment, now named dispatch_output_per_expert_alignment) as the
+      # leading non-diff arg of ep_dispatch/ep_combine. Must match
+      # state.dispatch_alignment so TE's recv-buffer layout lines up with the
+      # padded group_sizes computed in te_ep_expert_compute.
+      ep_cfg = EpLayerConfig(
+          top_k=self.num_experts_per_tok,
+          dispatch_output_per_expert_alignment=int(state.dispatch_alignment),
+      )
       recv_tokens, recv_weights, handle, token_counts = ep_dispatch(
+          ep_cfg,
           top_k_indices_2d,
           x_2d,
           weights_2d,
           state.recv_capacity_per_rank,
-          state.dispatch_alignment,
       )
       recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, ep_sharding_3d)
       recv_weights = jax.lax.with_sharding_constraint(recv_weights, ep_sharding_2d)
@@ -2122,6 +2131,18 @@ class RoutedMoE(nnx.Module):
         recv_t = recv_t.reshape(state.recv_capacity_per_rank, -1)
         recv_w = recv_w.reshape(state.recv_capacity_per_rank)
         tc = tc.reshape(state.num_local_experts)
+
+        # Zero padded recv-buffer slots before the GMM. This is a NaN guard, not a
+        # mask, and it is dtype-INDEPENDENT (bf16 and mxfp8 both hit it): padded
+        # recv_t rows hold uninitialized garbage, the forward GMM over them yields
+        # Inf, and the backward computes grad_w = saved_activation^T @ grad_out where
+        # the padded rows have grad_out=0 but saved_activation=Inf -> Inf*0=NaN in the
+        # expert weight grads (loss is finite at step 0, then NaN at step 1 after the
+        # optimizer applies the NaN grads). Restores the unconditional pre-GMM zeroing
+        # from commit 2924120f (later dropped only to test the B300 V2 path); it must
+        # NOT be gated on needs_v1_tail_absorb, which is the orthogonal mxfp8/sm_90
+        # tail-absorption flag and is False for bf16.
+        recv_t = jnp.where(recv_w[:, None] != 0, recv_t, 0)
 
         # Per-expert padded counts: TE EP lays each expert's block back-to-back in the
         # recv buffer, each block sized `ceil(tc[k] / dispatch_alignment) * dispatch_alignment`
@@ -2217,8 +2238,15 @@ class RoutedMoE(nnx.Module):
           intermediate_output = intermediate_output + wo_bias
         intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
 
-        # Mask out the padded slots so ep_combine doesn't include their contributions.
-        intermediate_output = jnp.where(recv_w[:, None] != 0, intermediate_output, 0)
+        # pr-3036 ep_combine is UNWEIGHTED: the caller must pre-multiply by the
+        # per-slot routing weight (recv_w; 0 for padded slots). The jnp.where is a
+        # NaN guard, not just a mask: recv_t padded slots are NOT zeroed before the
+        # GMM (see commit dropping pre-GMM recv_t zeroing), so they can produce
+        # Inf/NaN — a plain `* recv_w` would turn those into NaN (Inf*0=NaN) and
+        # leak them into ep_combine. Hard-select 0 for padded slots, weight the rest.
+        intermediate_output = jnp.where(
+            recv_w[:, None] != 0, intermediate_output * recv_w[:, None], 0.0
+        )
         return intermediate_output.reshape(recv_t_local_shape)
 
       expert_out = te_ep_expert_compute(
@@ -2228,10 +2256,10 @@ class RoutedMoE(nnx.Module):
         expert_out = expert_out.astype(jnp.bfloat16)
 
       output = ep_combine(
+          ep_cfg,
           handle,
           token_counts,
           expert_out,
-          recv_weights,
           num_local_tokens,
           out_sharding=tuple(state.input_spec_2d),
       )
