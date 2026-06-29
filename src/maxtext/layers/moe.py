@@ -2140,6 +2140,15 @@ class RoutedMoE(nnx.Module):
         recv_w = recv_w.reshape(state.recv_capacity_per_rank)
         tc = tc.reshape(state.num_local_experts)
 
+        align = jnp.int32(state.dispatch_alignment)
+        padded = ((tc + align - 1) // align) * align
+        starts = jnp.cumsum(padded) - padded
+        pos = jnp.arange(state.recv_capacity_per_rank, dtype=jnp.int32)
+        valid_slot = jnp.any(
+            (pos[:, None] >= starts[None, :]) & (pos[:, None] < (starts + tc)[None, :]),
+            axis=1,
+        )
+
         # Zero padded recv-buffer slots before the GMM. This is a NaN guard, not a
         # mask, and it is dtype-INDEPENDENT (bf16 and mxfp8 both hit it): padded
         # recv_t rows hold uninitialized garbage, the forward GMM over them yields
@@ -2150,22 +2159,24 @@ class RoutedMoE(nnx.Module):
         # from commit 2924120f (later dropped only to test the B300 V2 path); it must
         # NOT be gated on needs_v1_tail_absorb, which is the orthogonal mxfp8/sm_90
         # tail-absorption flag and is False for bf16.
-        recv_t = jnp.where(recv_w[:, None] != 0, recv_t, 0)
+        # Use structural token-count mask, not recv_w, to identify real slots.
+        # recv_w can contain nonzero garbage in overallocated tail slots.
+        safe_recv_w = jnp.where(valid_slot, recv_w, 0.0)
+        recv_t = jnp.where(valid_slot[:, None], recv_t, 0.0)
+
 
         # Per-expert padded counts: TE EP lays each expert's block back-to-back in the
         # recv buffer, each block sized `ceil(tc[k] / dispatch_alignment) * dispatch_alignment`
         # rows (mirrors HybridEP's `pad_multiple` layout). The GMM consumer uses these
         # padded counts as `group_sizes` so per-expert reads land at the right offsets.
-        # Padded slots within each expert's block have `recv_w == 0` (masked downstream
-        # before ep_combine).
-        align = jnp.int32(state.dispatch_alignment)
-        padded = ((tc + align - 1) // align) * align
+        # Padded/overallocated slots cannot be identified by recv_w: TE EP may leave
+        # nonzero garbage there, so valid_slot must come from token_counts.
         if state.needs_v1_tail_absorb:
           # sm_90: TE's V1 GroupedQuantizeFFI fallback for MXFP8 asserts
           # `sum(group_sizes) == m || sum == input_dims[0]`. Absorb the unused tail
-          # (recv_capacity − sum(padded)) into the last expert's group so the sum
-          # equals recv_capacity. The extra rows have `recv_w == 0` and produce
-          # masked-out zeros downstream. Adds ~17% GMM overhead but only path that
+          # (recv_capacity - sum(padded)) into the last expert's group so the sum
+          # equals recv_capacity. The extra rows are masked by valid_slot before
+          # the GMM and before ep_combine. Adds ~17% GMM overhead but only path that
           # works on Hopper. On Blackwell V2 path skips this assertion → no absorb.
           tail = jnp.int32(state.recv_capacity_per_rank) - padded.sum()
           group_sizes = padded.at[-1].add(tail)
@@ -2252,14 +2263,12 @@ class RoutedMoE(nnx.Module):
         intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
 
         # pr-3036 ep_combine is UNWEIGHTED: the caller must pre-multiply by the
-        # per-slot routing weight (recv_w; 0 for padded slots). The jnp.where is a
-        # NaN guard, not just a mask: recv_t padded slots are NOT zeroed before the
-        # GMM (see commit dropping pre-GMM recv_t zeroing), so they can produce
-        # Inf/NaN — a plain `* recv_w` would turn those into NaN (Inf*0=NaN) and
-        # leak them into ep_combine. Hard-select 0 for padded slots, weight the rest.
-        intermediate_output = jnp.where(
-            recv_w[:, None] != 0, intermediate_output * recv_w[:, None], 0.0
-        )
+        # per-slot routing weight. safe_recv_w is zero outside structural valid slots;
+        # hard-select zeros before/after multiplying so invalid tail values cannot
+        # produce Inf*0=NaN or leak into ep_combine/backward.
+        intermediate_output = jnp.where(valid_slot[:, None], intermediate_output, 0.0)
+        intermediate_output = intermediate_output * safe_recv_w[:, None]
+        intermediate_output = jnp.where(valid_slot[:, None], intermediate_output, 0.0)
         return intermediate_output.reshape(recv_t_local_shape)
 
       expert_out = te_ep_expert_compute(
