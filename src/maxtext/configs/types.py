@@ -2851,19 +2851,20 @@ class MaxTextConfig(
               "use_te_ep=True requires num_experts to be divisible by ici_expert_parallelism. "
               f"Got num_experts={self.num_experts}, ici_expert_parallelism={self.ici_expert_parallelism}."
           )
-        tensor_parallel_axes = {
-            "ici_tensor_parallelism": self.ici_tensor_parallelism,
+        unsupported_tensor_parallel_axes = {
             "dcn_tensor_parallelism": self.dcn_tensor_parallelism,
             "ici_tensor_transpose_parallelism": self.ici_tensor_transpose_parallelism,
             "dcn_tensor_transpose_parallelism": self.dcn_tensor_transpose_parallelism,
             "ici_tensor_sequence_parallelism": self.ici_tensor_sequence_parallelism,
             "dcn_tensor_sequence_parallelism": self.dcn_tensor_sequence_parallelism,
         }
-        active_tensor_axes = {name: size for name, size in tensor_parallel_axes.items() if size != 1}
-        if active_tensor_axes:
+        active_unsupported_tensor_axes = {
+            name: size for name, size in unsupported_tensor_parallel_axes.items() if size != 1
+        }
+        if active_unsupported_tensor_axes:
           raise ValueError(
-              "use_te_ep=True requires tensor parallelism size 1 for v1; "
-              f"non-unit tensor axes: {active_tensor_axes}."
+              "use_te_ep=True currently only allows ici_tensor_parallelism > 1 for v1; "
+              f"unsupported non-unit tensor axes: {active_unsupported_tensor_axes}."
           )
         if self.moe_permutation_group_align_size <= 0:
           raise ValueError("use_te_ep=True requires moe_permutation_group_align_size > 0 for aligned v1 dispatch.")

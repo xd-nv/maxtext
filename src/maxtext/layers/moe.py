@@ -2088,12 +2088,13 @@ class RoutedMoE(nnx.Module):
       weights_2d = weights.reshape(num_local_tokens, -1).astype(jnp.float32)
 
       input_sharding = NamedSharding(self.mesh, state.input_spec_2d)
+      routing_sharding = NamedSharding(self.mesh, state.routing_spec_2d)
       ep_sharding_2d = NamedSharding(self.mesh, state.ep_spec_2d)
       ep_sharding_3d = NamedSharding(self.mesh, state.ep_spec_3d)
 
       x_2d = jax.lax.with_sharding_constraint(x_2d, input_sharding)
-      top_k_indices_2d = jax.lax.with_sharding_constraint(top_k_indices_2d, input_sharding)
-      weights_2d = jax.lax.with_sharding_constraint(weights_2d, input_sharding)
+      top_k_indices_2d = jax.lax.with_sharding_constraint(top_k_indices_2d, routing_sharding)
+      weights_2d = jax.lax.with_sharding_constraint(weights_2d, routing_sharding)
 
       # pr-3036 threads a per-layer EpLayerConfig (top_k + the old
       # dispatch_alignment, now named dispatch_output_per_expert_alignment) as the

@@ -63,6 +63,8 @@ class TeEpState:
   outer_axis: str | None
   outer_size: int
   ep_size: int
+  tensor_axis: str | None
+  tensor_size: int
   expected_world_size: int
   num_experts: int
   num_local_experts: int
@@ -76,6 +78,7 @@ class TeEpState:
   needs_v1_tail_absorb: bool
   top_k: int          # config.num_experts_per_tok
   num_moe_layers: int # num_decoder_layers - first_num_dense_layers
+  routing_spec_2d: PartitionSpec
   input_spec_2d: PartitionSpec
   input_spec_3d: PartitionSpec
   ep_spec_2d: PartitionSpec
@@ -108,29 +111,30 @@ def select_te_ep_outer_axis(mesh: jax.sharding.Mesh) -> str | None:
   return None
 
 
-def _validate_v1_mesh(mesh: jax.sharding.Mesh, outer_axis: str | None) -> None:
-  """v1 only supports the expert axis plus one DP/FSDP outer axis being active."""
+def _validate_v1_mesh(mesh: jax.sharding.Mesh, outer_axis: str | None, tensor_axis: str | None) -> None:
+  """v1 supports EP, optional ICI TP, and one DP/FSDP outer axis being active."""
   active_axes = _active_mesh_axes(mesh)
   allowed = {_TE_EP_AXIS}
   if outer_axis is not None:
     allowed.add(outer_axis)
+  if tensor_axis is not None:
+    allowed.add(tensor_axis)
   unsupported = {axis: size for axis, size in active_axes.items() if axis not in allowed}
   if unsupported:
     raise ValueError(
-        "use_te_ep=True v1 supports only the expert axis plus one outer data/FSDP axis. "
+        "use_te_ep=True v1 supports only the expert axis, optional ICI tensor axis, "
+        "and one outer data/FSDP axis. "
         f"Unsupported active mesh axes: {unsupported}."
     )
 
 
-def _build_mesh_resource(outer_axis: str | None, ep_axis: str) -> Any:
+def _build_mesh_resource(outer_axis: str | None, ep_axis: str, tensor_axis: str | None) -> Any:
   """Build a MeshResource for TE EP bootstrap.
 
-  Sets ``fsdp_resource`` + ``ep_resource``; leaves ``tp_resource`` / ``cp_resource``
-  / ``dp_resource`` unset to match :func:`maxtext.utils.max_utils.transformer_engine_context`
-  under ``use_te_ep=true``. TE's ``_validate_mesh_resource_configuration`` calls
-  ``get_mesh_axis_size`` on every set resource, which asserts when the named
-  axis is missing from the active JAX mesh (e.g. inside ``jax.eval_shape``).
-  The TE EP validator already gates TP=CP=1 so stripping those is harmless.
+  Sets ``fsdp_resource`` + ``ep_resource`` and, when active, ``tp_resource``.
+  Leaves ``cp_resource`` unset. TE's ``_validate_mesh_resource_configuration``
+  calls ``get_mesh_axis_size`` on every set resource, which asserts when the
+  named axis is missing from the active JAX mesh (e.g. inside ``jax.eval_shape``).
   """
   from transformer_engine.jax.sharding import MeshResource  # pylint: disable=import-outside-toplevel
 
@@ -140,6 +144,8 @@ def _build_mesh_resource(outer_axis: str | None, ep_axis: str) -> Any:
   }
   if outer_axis == "data":
     kwargs["dp_resource"] = "data"
+  if tensor_axis is not None:
+    kwargs["tp_resource"] = tensor_axis
   return MeshResource(**kwargs)
 
 
@@ -255,7 +261,9 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   ep_size = _mesh_axis_size(mesh, _TE_EP_AXIS)
   outer_axis = select_te_ep_outer_axis(mesh)
   outer_size = _mesh_axis_size(mesh, outer_axis) if outer_axis is not None else 1
-  _validate_v1_mesh(mesh, outer_axis)
+  tensor_size = int(mesh.shape.get("tensor", 1))
+  tensor_axis = "tensor" if tensor_size > 1 else None
+  _validate_v1_mesh(mesh, outer_axis, tensor_axis)
 
   if int(config.num_experts) % ep_size != 0:
     raise ValueError(
@@ -264,8 +272,9 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
 
   num_local_experts = int(config.num_experts) // ep_size
   min_dispatch_alignment = int(config.moe_permutation_group_align_size)
-  expected_world_size = outer_size * ep_size
-  max_tokens_per_rank = _max_tokens_per_rank(config, expected_world_size)
+  token_partition_size = outer_size * ep_size
+  expected_world_size = token_partition_size * tensor_size
+  max_tokens_per_rank = _max_tokens_per_rank(config, token_partition_size)
   derived_recv_capacity = calculate_te_ep_capacity(
       max_tokens_per_rank=max_tokens_per_rank,
       ep_size=ep_size,
@@ -330,11 +339,14 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   num_moe_layers = int(config.num_decoder_layers) - int(config.first_num_dense_layers)
 
   leading_spec: Any = (outer_axis, _TE_EP_AXIS) if outer_axis is not None else _TE_EP_AXIS
+  hidden_spec: Any = tensor_axis
   config_key = (
       _TE_EP_AXIS,
       outer_axis,
       outer_size,
       ep_size,
+      tensor_axis,
+      tensor_size,
       expected_world_size,
       int(config.num_experts),
       int(config.num_experts_per_tok),
@@ -351,11 +363,13 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   )
 
   return TeEpState(
-      mesh_resource=_build_mesh_resource(outer_axis, _TE_EP_AXIS),
+      mesh_resource=_build_mesh_resource(outer_axis, _TE_EP_AXIS, tensor_axis),
       ep_axis=_TE_EP_AXIS,
       outer_axis=outer_axis,
       outer_size=outer_size,
       ep_size=ep_size,
+      tensor_axis=tensor_axis,
+      tensor_size=tensor_size,
       expected_world_size=expected_world_size,
       num_experts=int(config.num_experts),
       num_local_experts=num_local_experts,
@@ -369,10 +383,11 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       needs_v1_tail_absorb=needs_v1_tail_absorb,
       top_k=int(config.num_experts_per_tok),
       num_moe_layers=num_moe_layers,
-      input_spec_2d=PartitionSpec(leading_spec, None),
-      input_spec_3d=PartitionSpec(leading_spec, None, None),
+      routing_spec_2d=PartitionSpec(leading_spec, None),
+      input_spec_2d=PartitionSpec(leading_spec, hidden_spec),
+      input_spec_3d=PartitionSpec(leading_spec, None, hidden_spec),
       ep_spec_2d=PartitionSpec(leading_spec, None),
-      ep_spec_3d=PartitionSpec(leading_spec, None, None),
+      ep_spec_3d=PartitionSpec(leading_spec, None, hidden_spec),
       config_key=config_key,
   )
 
@@ -419,9 +434,10 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   rank = jax.process_index()
   if world_size != candidate.expected_world_size:
     raise ValueError(
-        "TE EP v1 expects one JAX process per active fsdp/expert mesh slot. "
+        "TE EP v1 expects one JAX process per active fsdp/expert/tensor mesh slot. "
         f"process_count={world_size}, expected={candidate.expected_world_size}, "
-        f"outer_axis={candidate.outer_axis}, ep_size={candidate.ep_size}."
+        f"outer_axis={candidate.outer_axis}, ep_size={candidate.ep_size}, "
+        f"tensor_axis={candidate.tensor_axis}, tensor_size={candidate.tensor_size}."
     )
 
   from transformer_engine.jax.ep import ep_bootstrap  # pylint: disable=import-outside-toplevel
@@ -449,6 +465,7 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       "TE EP bootstrapped: "
       f"outer_axis={candidate.outer_axis}, ep_axis={candidate.ep_axis}, "
       f"ep_size={candidate.ep_size}, outer_size={candidate.outer_size}, "
+      f"tensor_axis={candidate.tensor_axis}, tensor_size={candidate.tensor_size}, "
       f"num_moe_layers={candidate.num_moe_layers}, "
       f"max_tokens_per_rank={candidate.max_tokens_per_rank}, "
       f"recv_capacity_per_rank={candidate.recv_capacity_per_rank}, "
