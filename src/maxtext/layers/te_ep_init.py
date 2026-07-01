@@ -39,7 +39,7 @@ plans/jax_hybridep/te_ep_recv_capacity_overflow.md):
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import math
 import os
 from typing import Any
@@ -73,9 +73,8 @@ class TeEpState:
   max_num_sms: int
   em_unfused_num_sms: int
   needs_v1_tail_absorb: bool
-  top_k: int          # config.num_experts_per_tok — used by create_ep_handles()
+  top_k: int          # config.num_experts_per_tok
   num_moe_layers: int # num_decoder_layers - first_num_dense_layers
-  ep_handles: tuple   # one EpHandle per MoE layer; () until create_ep_handles() is called
   input_spec_2d: PartitionSpec
   input_spec_3d: PartitionSpec
   ep_spec_2d: PartitionSpec
@@ -367,7 +366,6 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       needs_v1_tail_absorb=needs_v1_tail_absorb,
       top_k=int(config.num_experts_per_tok),
       num_moe_layers=num_moe_layers,
-      ep_handles=(),  # populated lazily by create_ep_handles() in RoutedMoE.__init__
       input_spec_2d=PartitionSpec(leading_spec, None),
       input_spec_3d=PartitionSpec(leading_spec, None, None),
       ep_spec_2d=PartitionSpec(leading_spec, None),
@@ -380,11 +378,8 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   """Bootstrap TE NCCL EP exactly once per process.
 
   Must be called before ``setup_train_loop`` — model creation traces
-  ``moe.py`` which calls ``create_ep_handles()``. Idempotent for matching
+  ``moe.py`` which dispatches into ``ep_dispatch``. Idempotent for matching
   ``config_key``; raises on shape/resource mismatch.
-
-  EpHandles are NOT created here. They are created lazily and idempotently
-  in ``RoutedMoE.__init__`` via ``create_ep_handles()``, one per MoE layer.
   """
   from maxtext.common.common_types import DecoderBlockType  # pylint: disable=import-outside-toplevel
 
@@ -426,32 +421,26 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
         f"outer_axis={candidate.outer_axis}, ep_size={candidate.ep_size}."
     )
 
-  import inspect  # pylint: disable=import-outside-toplevel
   from transformer_engine.jax.ep import ep_bootstrap  # pylint: disable=import-outside-toplevel
   from transformer_engine.jax.sharding import global_shard_guard  # pylint: disable=import-outside-toplevel
 
   with mesh, jax.set_mesh(mesh), global_shard_guard(candidate.mesh_resource):
-    # allow_handle_mem_reloc=True is required when XLA's CUSTOM_CALL is in the
-    # command_buffer scope: XLA reallocates the EP handle_mem between captures
-    # and TE EP's get_or_open_handle() asserts unless reloc is allowed.
-    # max_num_permute_sms was renamed/dropped across TE versions; pass conditionally.
-    bootstrap_kwargs: dict = dict(
+    # TE EP branch pr-3036 signature: ep_size is derived internally from the
+    # mesh (MeshResource.ep_resource, set in _build_mesh_resource), so it is no
+    # longer passed explicitly. That branch also dropped the separate
+    # max_num_permute_sms knob (only max_num_sms remains) and the
+    # allow_handle_mem_reloc flag.
+    ep_bootstrap(
         world_size=world_size,
         rank=rank,
-        ep_size=candidate.ep_size,
         num_experts=candidate.num_experts,
         max_tokens_per_rank=candidate.max_tokens_per_rank,
         recv_capacity_per_rank=candidate.recv_capacity_per_rank,
         hidden_dim=candidate.hidden_dim,
         max_num_sms=candidate.max_num_sms,
-        allow_handle_mem_reloc=True,
     )
-    if "max_num_permute_sms" in inspect.signature(ep_bootstrap).parameters:
-      bootstrap_kwargs["max_num_permute_sms"] = candidate.em_unfused_num_sms
-    ep_bootstrap(**bootstrap_kwargs)
 
-  # EpHandles are created lazily in RoutedMoE.__init__ via create_ep_handles().
-  _TE_EP_STATE = candidate  # ep_handles=() until create_ep_handles() is called
+  _TE_EP_STATE = candidate
   max_logging.log(
       "TE EP bootstrapped: "
       f"outer_axis={candidate.outer_axis}, ep_axis={candidate.ep_axis}, "
@@ -470,51 +459,6 @@ def get_te_ep_state() -> TeEpState:
         "TE EP has not been initialized. Call init_te_ep_for_maxtext(config, mesh) before tracing MoE."
     )
   return _TE_EP_STATE
-
-
-def _ep_make_handle(top_k: int, dispatch_output_per_expert_alignment: int) -> Any:
-  """Thin wrapper around ep_make_handle — stable module attribute for monkeypatching in tests."""
-  from transformer_engine.jax.ep import ep_make_handle  # pylint: disable=import-outside-toplevel
-
-  return ep_make_handle(top_k, dispatch_output_per_expert_alignment)
-
-
-def create_ep_handles() -> tuple:
-  """Create one EpHandle per MoE layer and cache in _TE_EP_STATE.ep_handles.
-
-  Idempotent: returns the cached tuple on all subsequent calls. Safe to call
-  from RoutedMoE.__init__ which is re-invoked on every nnx_wrappers apply call.
-  Requires init_te_ep_for_maxtext to have been called first (ep_bootstrap live).
-  All parameters come from _TE_EP_STATE — no config argument needed.
-  """
-  global _TE_EP_STATE
-  if _TE_EP_STATE is None:
-    raise ValueError(
-        "init_te_ep_for_maxtext must be called before create_ep_handles. "
-        "RoutedMoE.__init__ should not be reached before train.py bootstraps TE EP."
-    )
-  if _TE_EP_STATE.ep_handles:
-    return _TE_EP_STATE.ep_handles  # already created — return cached tuple
-  if _TE_EP_STATE.num_moe_layers <= 0:
-    raise ValueError(
-        f"num_moe_layers={_TE_EP_STATE.num_moe_layers}; check num_decoder_layers "
-        "and first_num_dense_layers in config."
-    )
-  handles = tuple(
-      _ep_make_handle(
-          _TE_EP_STATE.top_k,
-          dispatch_output_per_expert_alignment=_TE_EP_STATE.dispatch_alignment,
-      )
-      for _ in range(_TE_EP_STATE.num_moe_layers)
-  )
-  _TE_EP_STATE = replace(_TE_EP_STATE, ep_handles=handles)
-  handle_ids = [getattr(h, "handle_id", "?") for h in handles]
-  max_logging.log(
-      f"TE EP: created {_TE_EP_STATE.num_moe_layers} handles "
-      f"(ids {handle_ids[0]}..{handle_ids[-1]})"
-  )
-  return handles
-
 
 def reset_te_ep_state_for_test() -> None:
   """Test-only: clear the singleton. Does NOT tear down the underlying TE NCCL state."""
