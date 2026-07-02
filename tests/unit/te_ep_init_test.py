@@ -19,7 +19,9 @@ The TE NCCL EP and global_shard_guard imports inside
 ``transformer_engine`` to be installed.
 """
 
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from maxtext.layers import te_ep_init
 
@@ -162,6 +164,44 @@ class ModuleSurfaceTest(unittest.TestCase):
     te_ep_init.reset_te_ep_state_for_test()
     with self.assertRaisesRegex(ValueError, "not been initialized"):
       te_ep_init.get_te_ep_state()
+
+
+class BuildTeEpStateTest(unittest.TestCase):
+  """Pure-Python TE EP state construction checks."""
+
+  def _config(self):
+    return SimpleNamespace(
+        num_experts=256,
+        num_experts_per_tok=8,
+        moe_permutation_group_align_size=128,
+        te_ep_recv_capacity_factor=1.0,
+        micro_batch_size_to_train_on=32,
+        max_target_length=2048,
+        num_decoder_layers=61,
+        first_num_dense_layers=3,
+        moe_expert_input_dim=-1,
+        emb_dim=7168,
+        te_ep_max_num_sms=0,
+        te_ep_em_unfused_num_sms=-1,
+    )
+
+  def test_ici_tensor_parallelism_updates_world_size_not_token_capacity(self):
+    mesh = SimpleNamespace(shape={"fsdp": 2, "expert": 8, "tensor": 2})
+
+    with patch.object(te_ep_init, "_build_mesh_resource", return_value="mesh-resource"):
+      state = te_ep_init.build_te_ep_state(self._config(), mesh)
+
+    self.assertEqual(state.mesh_resource, "mesh-resource")
+    self.assertEqual(state.outer_axis, "fsdp")
+    self.assertEqual(state.outer_size, 2)
+    self.assertEqual(state.ep_size, 8)
+    self.assertEqual(state.tensor_axis, "tensor")
+    self.assertEqual(state.tensor_size, 2)
+    self.assertEqual(state.expected_world_size, 2 * 8 * 2)
+    # Token routing capacity is partitioned by outer*EP only; TP shards hidden dim.
+    self.assertEqual(state.max_tokens_per_rank, 4096)
+    self.assertEqual(state.routing_spec_2d, te_ep_init.PartitionSpec(("fsdp", "expert"), None))
+    self.assertEqual(state.input_spec_2d, te_ep_init.PartitionSpec(("fsdp", "expert"), "tensor"))
 
 
 if __name__ == "__main__":

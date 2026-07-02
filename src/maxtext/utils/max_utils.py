@@ -1124,15 +1124,9 @@ def transformer_engine_context(config=None):
   When ``config.use_te_ep`` is true, ``ep_resource="expert"`` is added so
   TE NCCL EP's custom_partitioning can resolve the EP axis at lowering time.
   ``tp_resource`` / ``cp_resource`` / ``dp_resource`` are set to ``None`` so
-  TE picks ``fsdp_resource`` as the outer companion to ``ep_resource``.
-
-  Why tp/cp are stripped under use_te_ep: TE's ``_validate_mesh_resource_configuration``
-  calls ``get_mesh_axis_size`` on every set resource at trace time, which
-  asserts when the named axis is missing from the active JAX mesh. During
-  ``jax.eval_shape`` (model init) there is no active mesh, so any set
-  ``tp_resource="tensor"`` etc. would fail validation. The TE EP validator
-  already gates ``ici_tensor_parallelism == ici_context_parallelism == 1``,
-  so stripping those resources is harmless in practice.
+  TE picks ``fsdp_resource`` as the outer companion to ``ep_resource``.  The
+  TE EP MoE wrapper re-enters a mesh-scoped guard with ``tp_resource`` only
+  around ``ep_dispatch``/``ep_combine`` when ICI TP is active.
   """
   try:
     from transformer_engine.jax.sharding import global_shard_guard, MeshResource  # pylint: disable=import-outside-toplevel

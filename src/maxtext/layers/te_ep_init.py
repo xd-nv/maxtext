@@ -20,7 +20,8 @@ installed; TE imports happen lazily inside :func:`init_te_ep_for_maxtext`.
 
 Lessons baked in (see plans/jax_hybridep/te_ep_maxtext_v2_todo.md and
 plans/jax_hybridep/te_ep_recv_capacity_overflow.md):
-  * MeshResource preserves tp/cp from the outer context (does not strip).
+  * MeshResource preserves optional ICI TP for TE EP bootstrap and MoE
+    dispatch/combine, while the outer train context can keep TP unset.
   * ``dispatch_alignment`` passed to TE EP is the *small* alignment
     ``moe_permutation_group_align_size`` (default 128). This minimizes per-expert
     padding overhead, matching how HybridEP/DeepEP uses ``pad_multiple``. Earlier

@@ -183,11 +183,26 @@ class ConfigTest(unittest.TestCase):
       pyconfig.initialize(self._te_ep_argv("use_te_ep=true", "use_hybrid_ep=true"))
 
   @patch("jax.devices")
-  def test_te_ep_rejects_tensor_parallelism(self, mock_devices):
-    """v1 gates TE EP to replicated hidden dims (no TP/CP/TSP)."""
+  def test_te_ep_allows_ici_tensor_parallelism(self, mock_devices):
+    """TE EP v1 allows tensor parallelism inside the ICI/NVLink domain."""
     mock_devices.return_value = [MagicMock(slice_index=0) for _ in range(8)]
-    with self.assertRaisesRegex(pydantic.ValidationError, "tensor parallelism size 1"):
-      pyconfig.initialize(self._te_ep_argv("use_te_ep=true", "ici_tensor_parallelism=2"))
+    config = pyconfig.initialize(self._te_ep_argv("use_te_ep=true", "ici_tensor_parallelism=2"))
+    self.assertTrue(config.use_te_ep)
+    self.assertEqual(config.ici_tensor_parallelism, 2)
+
+  @patch("jax.devices")
+  def test_te_ep_rejects_dcn_tensor_parallelism(self, mock_devices):
+    """TE EP v1 keeps tensor parallelism off the DCN/IB axis."""
+    mock_devices.return_value = [MagicMock(slice_index=0) for _ in range(8)]
+    with self.assertRaisesRegex(pydantic.ValidationError, "only allows ici_tensor_parallelism"):
+      pyconfig.initialize(self._te_ep_argv("use_te_ep=true", "dcn_tensor_parallelism=2"))
+
+  @patch("jax.devices")
+  def test_te_ep_rejects_ici_tensor_parallelism_above_two(self, mock_devices):
+    """Only TP1/TP2 are covered by the local TE EP + TP experiment."""
+    mock_devices.return_value = [MagicMock(slice_index=0) for _ in range(16)]
+    with self.assertRaisesRegex(pydantic.ValidationError, "only ici_tensor_parallelism 1 or 2"):
+      pyconfig.initialize(self._te_ep_argv("use_te_ep=true", "ici_tensor_parallelism=4"))
 
   @patch("jax.devices")
   def test_te_ep_rejects_non_power_of_two_alignment(self, mock_devices):

@@ -2851,6 +2851,11 @@ class MaxTextConfig(
               "use_te_ep=True requires num_experts to be divisible by ici_expert_parallelism. "
               f"Got num_experts={self.num_experts}, ici_expert_parallelism={self.ici_expert_parallelism}."
           )
+        if self.ici_tensor_parallelism not in (1, 2):
+          raise ValueError(
+              "use_te_ep=True currently supports only ici_tensor_parallelism 1 or 2 for v1; "
+              f"got ici_tensor_parallelism={self.ici_tensor_parallelism}."
+          )
         unsupported_tensor_parallel_axes = {
             "dcn_tensor_parallelism": self.dcn_tensor_parallelism,
             "ici_tensor_transpose_parallelism": self.ici_tensor_transpose_parallelism,

@@ -16,8 +16,8 @@
 
 Verifies that:
   * Without use_te_ep: ep_resource is None; dp_resource="data".
-  * With use_te_ep=True: ep_resource="expert"; dp_resource=None (TE picks
-    fsdp_resource as the outer); tp/fsdp/cp are preserved (not stripped).
+  * With use_te_ep=True: ep_resource="expert"; tp/dp/cp stay unset in the
+    outer context so eval_shape does not validate resources before a mesh exists.
 """
 
 from types import SimpleNamespace
@@ -51,16 +51,19 @@ class TransformerEngineContextTest(unittest.TestCase):
       self.assertIsNone(mr.ep_resource)
 
   def test_with_te_ep_strips_tp_cp_dp(self):
-    """Under use_te_ep, tp/cp/dp are stripped to avoid TE's empty-mesh validation.
-
-    TE's _validate_mesh_resource_configuration calls get_mesh_axis_size on every
-    set resource at trace time. During jax.eval_shape (model init) there's no
-    active JAX mesh, so any set tp_resource="tensor"/cp_resource/dp_resource
-    asserts. v1 ran into this and worked around it by entering a `with self.mesh`
-    inside te_ep_wrapper; v2 strips them at the context-manager level since the
-    TE EP validator gates TP=CP=1 anyway.
-    """
+    """The outer TE EP context keeps only fsdp/expert resources active."""
     config = SimpleNamespace(use_te_ep=True)
+    with max_utils.transformer_engine_context(config):
+      mr = self._active_resource()
+      self.assertEqual(mr.ep_resource, "expert")
+      self.assertEqual(mr.fsdp_resource, "fsdp")
+      self.assertIsNone(mr.tp_resource)
+      self.assertIsNone(mr.cp_resource)
+      self.assertIsNone(mr.dp_resource)
+
+  def test_with_te_ep_and_ici_tp_still_strips_outer_tp(self):
+    """TP is supplied by the MoE wrapper's mesh-scoped guard, not this context."""
+    config = SimpleNamespace(use_te_ep=True, ici_tensor_parallelism=2)
     with max_utils.transformer_engine_context(config):
       mr = self._active_resource()
       self.assertEqual(mr.ep_resource, "expert")

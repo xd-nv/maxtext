@@ -2049,10 +2049,10 @@ class RoutedMoE(nnx.Module):
       shard_map fixes shardings prematurely and breaks the partitioner. The
       expert-compute GMM still runs under a local shard_map below.
 
-      The outer `transformer_engine_context` wraps `train_loop` with a
-      `global_shard_guard` that includes `ep_resource="expert"`, so the TE EP
-      primitives see the correct MeshResource at lowering time. No inner
-      `global_shard_guard` re-entry is needed here.
+      Re-enters a mesh-scoped TE ``global_shard_guard`` below using the same
+      MeshResource built during TE EP bootstrap. This is required for ICI TP:
+      the outer train context intentionally leaves ``tp_resource`` unset to
+      avoid early eval_shape validation before MaxText has entered a JAX mesh.
       """
       if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
         raise NotImplementedError(
@@ -2063,6 +2063,7 @@ class RoutedMoE(nnx.Module):
 
       from maxtext.layers import te_ep_init  # pylint: disable=import-outside-toplevel
       from transformer_engine.jax.ep import EpLayerConfig, ep_combine, ep_dispatch  # pylint: disable=import-outside-toplevel
+      from transformer_engine.jax.sharding import global_shard_guard  # pylint: disable=import-outside-toplevel
 
       state = te_ep_init.get_te_ep_state()
       batch_size, sequence_length, _ = x.shape
@@ -2105,21 +2106,22 @@ class RoutedMoE(nnx.Module):
           top_k=self.num_experts_per_tok,
           dispatch_output_per_expert_alignment=int(state.dispatch_alignment),
       )
-      recv_tokens, recv_weights, handle, token_counts, total_recv_tokens = ep_dispatch(
-          ep_cfg,
-          top_k_indices_2d,
-          x_2d,
-          weights_2d,
-          state.recv_capacity_per_rank,
-      )
-      recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, ep_sharding_3d)
-      recv_weights = jax.lax.with_sharding_constraint(recv_weights, ep_sharding_2d)
-      token_counts = jax.lax.with_sharding_constraint(token_counts, ep_sharding_2d)
-      total_recv_tokens = jax.lax.with_sharding_constraint(total_recv_tokens, ep_sharding_2d)
-      # PR3277 reports each rank's padded pre-drop receive demand. Preserve the
-      # existing MoE return contract and expose the telemetry as an NNX
-      # intermediate for train-step aggregation.
-      self.sow(nnx.Intermediate, "te_ep_total_recv_tokens", total_recv_tokens)
+      with self.mesh, jax.set_mesh(self.mesh), global_shard_guard(state.mesh_resource):
+        recv_tokens, recv_weights, handle, token_counts, total_recv_tokens = ep_dispatch(
+            ep_cfg,
+            top_k_indices_2d,
+            x_2d,
+            weights_2d,
+            state.recv_capacity_per_rank,
+        )
+        recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, ep_sharding_3d)
+        recv_weights = jax.lax.with_sharding_constraint(recv_weights, ep_sharding_2d)
+        token_counts = jax.lax.with_sharding_constraint(token_counts, ep_sharding_2d)
+        total_recv_tokens = jax.lax.with_sharding_constraint(total_recv_tokens, ep_sharding_2d)
+        # PR3277 reports each rank's padded pre-drop receive demand. Preserve the
+        # existing MoE return contract and expose the telemetry as an NNX
+        # intermediate for train-step aggregation.
+        self.sow(nnx.Intermediate, "te_ep_total_recv_tokens", total_recv_tokens)
 
       @functools.partial(
           jax.shard_map,
@@ -2283,14 +2285,15 @@ class RoutedMoE(nnx.Module):
       if expert_out.dtype != jnp.bfloat16:
         expert_out = expert_out.astype(jnp.bfloat16)
 
-      output = ep_combine(
-          ep_cfg,
-          handle,
-          token_counts,
-          expert_out,
-          num_local_tokens,
-          out_sharding=tuple(state.input_spec_2d),
-      )
+      with self.mesh, jax.set_mesh(self.mesh), global_shard_guard(state.mesh_resource):
+        output = ep_combine(
+            ep_cfg,
+            handle,
+            token_counts,
+            expert_out,
+            num_local_tokens,
+            out_sharding=tuple(state.input_spec_2d),
+        )
       output = jax.lax.with_sharding_constraint(output, input_sharding)
       return output.reshape(batch_size, sequence_length, -1).astype(self.dtype), lb_loss, bias_updates
 
