@@ -2269,6 +2269,10 @@ class RoutedMoE(nnx.Module):
         # its internal weighted = expert_out * w * mask path is exercised
         # (matches OLD TE EP path that worked at ~427 TFLOP/s on job 1949999).
         intermediate_output = gmm_fn(intermediate_layer, wo, tiling=wo_tile_size, weight_gather_axes=wo_gather_axes)
+        if self.get_tensor_parallelism_size() > 1:
+          intermediate_output = jax.lax.psum_scatter(
+              intermediate_output, self._tensor_parallelism_name, scatter_dimension=1, tiled=True
+          )
         if self.config.mlp_bias:
           intermediate_output = intermediate_output + wo_bias
         intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
