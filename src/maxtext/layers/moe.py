@@ -2053,6 +2053,9 @@ class RoutedMoE(nnx.Module):
       MeshResource built during TE EP bootstrap. This is required for ICI TP:
       the outer train context intentionally leaves ``tp_resource`` unset to
       avoid early eval_shape validation before MaxText has entered a JAX mesh.
+      Do not call ``jax.set_mesh`` here — this wrapper runs under
+      ``jax.eval_shape`` / ``jax.jit``, where ``set_mesh`` is illegal; the
+      outer train / init context already owns the ambient mesh.
       """
       if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
         raise NotImplementedError(
@@ -2106,7 +2109,7 @@ class RoutedMoE(nnx.Module):
           top_k=self.num_experts_per_tok,
           dispatch_output_per_expert_alignment=int(state.dispatch_alignment),
       )
-      with self.mesh, jax.set_mesh(self.mesh), global_shard_guard(state.mesh_resource):
+      with self.mesh, global_shard_guard(state.mesh_resource):
         recv_tokens, recv_weights, handle, token_counts, total_recv_tokens = ep_dispatch(
             ep_cfg,
             top_k_indices_2d,
@@ -2285,7 +2288,7 @@ class RoutedMoE(nnx.Module):
       if expert_out.dtype != jnp.bfloat16:
         expert_out = expert_out.astype(jnp.bfloat16)
 
-      with self.mesh, jax.set_mesh(self.mesh), global_shard_guard(state.mesh_resource):
+      with self.mesh, global_shard_guard(state.mesh_resource):
         output = ep_combine(
             ep_cfg,
             handle,
