@@ -23,8 +23,6 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-import numpy as np
-
 from maxtext.layers import te_ep_init
 
 
@@ -201,60 +199,46 @@ class BuildTeEpStateTest(unittest.TestCase):
     self.assertEqual(state.tensor_axis, "tensor")
     self.assertEqual(state.tensor_size, 2)
     self.assertEqual(state.dense_tensor_size, 2)
-    self.assertFalse(state.uses_folded_mesh)
+    self.assertFalse(state.uses_etp1_view)
     self.assertEqual(state.expected_world_size, 2 * 8 * 2)
     # Token routing capacity is partitioned by outer*EP only; TP shards hidden dim.
     self.assertEqual(state.max_tokens_per_rank, 4096)
     self.assertEqual(state.routing_spec_2d, te_ep_init.PartitionSpec(("fsdp", "expert"), None))
     self.assertEqual(state.input_spec_2d, te_ep_init.PartitionSpec(("fsdp", "expert"), "tensor"))
-    self.assertEqual(state.compute_ep_spec_3d, state.ep_spec_3d)
 
-  def test_etp1_folds_dense_tensor_into_expert_data_parallelism(self):
+  def test_etp1_reuses_dense_tensor_as_expert_data_parallelism(self):
     config = self._config()
     config.te_ep_expert_tensor_parallelism = 1
-    dense_mesh = SimpleNamespace(shape={"fsdp": 2, "expert": 8, "tensor": 2})
-    folded_mesh = SimpleNamespace(shape={"te_ep_outer": 4, "expert": 8})
+    mesh = SimpleNamespace(shape={"fsdp": 1, "expert": 16, "tensor": 2})
 
-    with (
-        patch.object(te_ep_init, "_build_etp1_mesh", return_value=folded_mesh),
-        patch.object(te_ep_init, "_build_mesh_resource", return_value="etp1-resource"),
-    ):
-      state = te_ep_init.build_te_ep_state(config, dense_mesh)
+    with patch.object(te_ep_init, "_build_mesh_resource", return_value="etp1-resource"):
+      state = te_ep_init.build_te_ep_state(config, mesh)
 
-    self.assertIs(state.mesh, folded_mesh)
+    self.assertIs(state.mesh, mesh)
     self.assertEqual(state.mesh_resource, "etp1-resource")
-    self.assertEqual(state.outer_axis, "te_ep_outer")
-    self.assertEqual(state.outer_size, 4)
-    self.assertEqual(state.ep_size, 8)
+    self.assertEqual(state.outer_axis, "tensor")
+    self.assertEqual(state.outer_size, 2)
+    self.assertEqual(state.ep_size, 16)
     self.assertIsNone(state.tensor_axis)
     self.assertEqual(state.tensor_size, 1)
     self.assertEqual(state.dense_tensor_size, 2)
-    self.assertTrue(state.uses_folded_mesh)
-    self.assertEqual(state.expected_world_size, 4 * 8)
+    self.assertTrue(state.uses_etp1_view)
+    self.assertEqual(state.expected_world_size, 2 * 16)
     # All 32 ranks own distinct local token shards with complete hidden state.
     self.assertEqual(state.max_tokens_per_rank, 2048)
-    self.assertEqual(state.routing_spec_2d, te_ep_init.PartitionSpec(("te_ep_outer", "expert"), None))
-    self.assertEqual(state.input_spec_2d, te_ep_init.PartitionSpec(("te_ep_outer", "expert"), None))
-    self.assertEqual(
-        state.compute_ep_spec_3d,
-        te_ep_init.PartitionSpec(("fsdp", "tensor", "expert"), None, None),
-    )
+    self.assertEqual(state.routing_spec_2d, te_ep_init.PartitionSpec(("tensor", "expert"), None))
+    self.assertEqual(state.input_spec_2d, te_ep_init.PartitionSpec(("tensor", "expert"), None))
 
-  def test_etp1_rank_mapping_preserves_existing_ep_groups(self):
-    devices = np.arange(2 * 8 * 2).reshape(2, 8, 2)
-    mesh = SimpleNamespace(
-        axis_names=("fsdp", "expert", "tensor"),
-        shape={"fsdp": 2, "expert": 8, "tensor": 2},
-        devices=devices,
-    )
+  def test_etp1_rejects_additional_fsdp_replicas(self):
+    config = self._config()
+    config.te_ep_expert_tensor_parallelism = 1
+    mesh = SimpleNamespace(shape={"fsdp": 2, "expert": 8, "tensor": 2})
 
-    folded = te_ep_init._fold_etp1_devices(mesh)
-
-    self.assertEqual(folded.shape, (4, 8))
-    np.testing.assert_array_equal(folded[0], devices[0, :, 0])
-    np.testing.assert_array_equal(folded[1], devices[0, :, 1])
-    np.testing.assert_array_equal(folded[2], devices[1, :, 0])
-    np.testing.assert_array_equal(folded[3], devices[1, :, 1])
+    with self.assertRaisesRegex(
+        ValueError,
+        "requires data/fsdp axes to have size 1",
+    ):
+      te_ep_init.build_te_ep_state(config, mesh)
 
 
 if __name__ == "__main__":

@@ -47,13 +47,11 @@ from typing import Any
 
 import jax
 from jax.sharding import PartitionSpec
-import numpy as np
 
 from maxtext.utils import max_logging
 
 
 _TE_EP_AXIS = "expert"
-_TE_EP_OUTER_AXIS = "te_ep_outer"
 _TE_EP_STATE: "TeEpState | None" = None
 
 
@@ -70,7 +68,7 @@ class TeEpState:
   tensor_axis: str | None
   tensor_size: int
   dense_tensor_size: int
-  uses_folded_mesh: bool
+  uses_etp1_view: bool
   expected_world_size: int
   num_experts: int
   num_local_experts: int
@@ -89,8 +87,6 @@ class TeEpState:
   input_spec_3d: PartitionSpec
   ep_spec_2d: PartitionSpec
   ep_spec_3d: PartitionSpec
-  compute_ep_spec_2d: PartitionSpec
-  compute_ep_spec_3d: PartitionSpec
   config_key: tuple[Any, ...]
 
 
@@ -104,40 +100,6 @@ def _mesh_axis_size(mesh: jax.sharding.Mesh, axis: str) -> int:
 
 def _active_mesh_axes(mesh: jax.sharding.Mesh) -> dict[str, int]:
   return {axis: int(size) for axis, size in mesh.shape.items() if int(size) > 1}
-
-
-def _fold_etp1_devices(mesh: jax.sharding.Mesh) -> np.ndarray:
-  """Return devices ordered as ``[expert-DP, EP]`` for the ETP1 view."""
-  axis_names = tuple(mesh.axis_names)
-  ep_index = axis_names.index(_TE_EP_AXIS)
-  outer_indices = [idx for idx in range(len(axis_names)) if idx != ep_index]
-  devices = np.asarray(mesh.devices)
-  devices = np.transpose(devices, tuple(outer_indices + [ep_index]))
-  ep_size = int(mesh.shape[_TE_EP_AXIS])
-  return devices.reshape(devices.size // ep_size, ep_size)
-
-
-def _build_etp1_mesh(mesh: jax.sharding.Mesh) -> jax.sharding.Mesh:
-  """Fold every non-EP mesh axis into one expert-DP axis.
-
-  Moving ``expert`` to the final dimension preserves each existing EP group
-  while reinterpreting dense TP/FSDP coordinates as expert-DP replicas.  This
-  is the small-scale analogue of Megatron's separate dense and expert rank
-  generators.
-  """
-  devices = _fold_etp1_devices(mesh)
-  outer_size, ep_size = devices.shape
-  original_axis_types = getattr(mesh, "axis_types", None)
-  axis_type = original_axis_types[0] if original_axis_types else None
-  if outer_size == 1:
-    kwargs = {"axis_types": (axis_type,)} if axis_type is not None else {}
-    return jax.sharding.Mesh(devices.reshape(ep_size), (_TE_EP_AXIS,), **kwargs)
-  kwargs = {"axis_types": (axis_type, axis_type)} if axis_type is not None else {}
-  return jax.sharding.Mesh(
-      devices.reshape(outer_size, ep_size),
-      (_TE_EP_OUTER_AXIS, _TE_EP_AXIS),
-      **kwargs,
-  )
 
 
 def select_te_ep_outer_axis(mesh: jax.sharding.Mesh) -> str | None:
@@ -181,8 +143,8 @@ def _build_mesh_resource(outer_axis: str | None, ep_axis: str, tensor_axis: str 
   from transformer_engine.jax.sharding import MeshResource  # pylint: disable=import-outside-toplevel
 
   kwargs: dict[str, Any] = {"ep_resource": ep_axis}
-  if outer_axis == "data":
-    kwargs["dp_resource"] = "data"
+  if outer_axis in ("data", "tensor"):
+    kwargs["dp_resource"] = outer_axis
   elif outer_axis is not None:
     kwargs["fsdp_resource"] = outer_axis
   if tensor_axis is not None:
@@ -311,17 +273,25 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   dense_tensor_axis = "tensor" if dense_tensor_size > 1 else None
   _validate_v1_mesh(mesh, dense_outer_axis, dense_tensor_axis)
 
-  uses_folded_mesh = requested_etp == 1 and dense_tensor_size > 1
-  if uses_folded_mesh:
-    te_mesh = _build_etp1_mesh(mesh)
-    ep_size = _mesh_axis_size(te_mesh, _TE_EP_AXIS)
-    outer_axis = _TE_EP_OUTER_AXIS
-    outer_size = _mesh_axis_size(te_mesh, outer_axis)
+  uses_etp1_view = requested_etp == 1
+  te_mesh = mesh
+  ep_size = _mesh_axis_size(mesh, _TE_EP_AXIS)
+  if uses_etp1_view:
+    dense_outer_size = (
+        _mesh_axis_size(mesh, dense_outer_axis) if dense_outer_axis is not None else 1
+    )
+    if dense_outer_size > 1:
+      raise ValueError(
+          "TE EP ETP1 uses the dense tensor axis as expert-DP and therefore "
+          "requires data/fsdp axes to have size 1. Increase expert parallelism "
+          "instead of adding an orthogonal data/fsdp replica axis; "
+          f"got {dense_outer_axis}={dense_outer_size}."
+      )
+    outer_axis = dense_tensor_axis or dense_outer_axis
+    outer_size = _mesh_axis_size(mesh, outer_axis) if outer_axis is not None else 1
     tensor_axis = None
     tensor_size = 1
   else:
-    te_mesh = mesh
-    ep_size = _mesh_axis_size(mesh, _TE_EP_AXIS)
     outer_axis = dense_outer_axis
     outer_size = _mesh_axis_size(mesh, outer_axis) if outer_axis is not None else 1
     tensor_axis = dense_tensor_axis
@@ -402,22 +372,6 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
 
   leading_spec: Any = (outer_axis, _TE_EP_AXIS) if outer_axis is not None else _TE_EP_AXIS
   hidden_spec: Any = tensor_axis
-  if uses_folded_mesh:
-    original_axis_names = tuple(getattr(mesh, "axis_names", tuple(mesh.shape.keys())))
-    compute_leading_axes = [
-        axis
-        for axis in original_axis_names
-        if axis != _TE_EP_AXIS and int(mesh.shape[axis]) > 1
-    ]
-    compute_leading_axes.append(_TE_EP_AXIS)
-    compute_leading_spec: Any = (
-        compute_leading_axes[0] if len(compute_leading_axes) == 1 else tuple(compute_leading_axes)
-    )
-    compute_ep_spec_2d = PartitionSpec(compute_leading_spec, None)
-    compute_ep_spec_3d = PartitionSpec(compute_leading_spec, None, None)
-  else:
-    compute_ep_spec_2d = PartitionSpec(leading_spec, None)
-    compute_ep_spec_3d = PartitionSpec(leading_spec, None, hidden_spec)
   config_key = (
       _TE_EP_AXIS,
       outer_axis,
@@ -426,7 +380,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       tensor_axis,
       tensor_size,
       dense_tensor_size,
-      uses_folded_mesh,
+      uses_etp1_view,
       expected_world_size,
       int(config.num_experts),
       int(config.num_experts_per_tok),
@@ -452,7 +406,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       tensor_axis=tensor_axis,
       tensor_size=tensor_size,
       dense_tensor_size=dense_tensor_size,
-      uses_folded_mesh=uses_folded_mesh,
+      uses_etp1_view=uses_etp1_view,
       expected_world_size=expected_world_size,
       num_experts=int(config.num_experts),
       num_local_experts=num_local_experts,
@@ -471,8 +425,6 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       input_spec_3d=PartitionSpec(leading_spec, None, hidden_spec),
       ep_spec_2d=PartitionSpec(leading_spec, None),
       ep_spec_3d=PartitionSpec(leading_spec, None, hidden_spec),
-      compute_ep_spec_2d=compute_ep_spec_2d,
-      compute_ep_spec_3d=compute_ep_spec_3d,
       config_key=config_key,
   )
 
@@ -551,7 +503,7 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       f"outer_axis={candidate.outer_axis}, ep_axis={candidate.ep_axis}, "
       f"ep_size={candidate.ep_size}, outer_size={candidate.outer_size}, "
       f"tensor_axis={candidate.tensor_axis}, expert_tensor_size={candidate.tensor_size}, "
-      f"dense_tensor_size={candidate.dense_tensor_size}, folded_mesh={candidate.uses_folded_mesh}, "
+      f"dense_tensor_size={candidate.dense_tensor_size}, etp1_view={candidate.uses_etp1_view}, "
       f"num_moe_layers={candidate.num_moe_layers}, "
       f"max_tokens_per_rank={candidate.max_tokens_per_rank}, "
       f"recv_capacity_per_rank={candidate.recv_capacity_per_rank}, "
