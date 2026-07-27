@@ -47,11 +47,13 @@ from typing import Any
 
 import jax
 from jax.sharding import PartitionSpec
+import numpy as np
 
 from maxtext.utils import max_logging
 
 
 _TE_EP_AXIS = "expert"
+_TE_EP_OUTER_AXIS = "te_ep_outer"
 _TE_EP_STATE: "TeEpState | None" = None
 
 
@@ -59,6 +61,7 @@ _TE_EP_STATE: "TeEpState | None" = None
 class TeEpState:
   """Process-local TE EP bootstrap state."""
 
+  mesh: Any
   mesh_resource: Any
   ep_axis: str
   outer_axis: str | None
@@ -66,6 +69,8 @@ class TeEpState:
   ep_size: int
   tensor_axis: str | None
   tensor_size: int
+  dense_tensor_size: int
+  uses_folded_mesh: bool
   expected_world_size: int
   num_experts: int
   num_local_experts: int
@@ -97,6 +102,40 @@ def _mesh_axis_size(mesh: jax.sharding.Mesh, axis: str) -> int:
 
 def _active_mesh_axes(mesh: jax.sharding.Mesh) -> dict[str, int]:
   return {axis: int(size) for axis, size in mesh.shape.items() if int(size) > 1}
+
+
+def _fold_etp1_devices(mesh: jax.sharding.Mesh) -> np.ndarray:
+  """Return devices ordered as ``[expert-DP, EP]`` for the ETP1 view."""
+  axis_names = tuple(mesh.axis_names)
+  ep_index = axis_names.index(_TE_EP_AXIS)
+  outer_indices = [idx for idx in range(len(axis_names)) if idx != ep_index]
+  devices = np.asarray(mesh.devices)
+  devices = np.transpose(devices, tuple(outer_indices + [ep_index]))
+  ep_size = int(mesh.shape[_TE_EP_AXIS])
+  return devices.reshape(devices.size // ep_size, ep_size)
+
+
+def _build_etp1_mesh(mesh: jax.sharding.Mesh) -> jax.sharding.Mesh:
+  """Fold every non-EP mesh axis into one expert-DP axis.
+
+  Moving ``expert`` to the final dimension preserves each existing EP group
+  while reinterpreting dense TP/FSDP coordinates as expert-DP replicas.  This
+  is the small-scale analogue of Megatron's separate dense and expert rank
+  generators.
+  """
+  devices = _fold_etp1_devices(mesh)
+  outer_size, ep_size = devices.shape
+  original_axis_types = getattr(mesh, "axis_types", None)
+  axis_type = original_axis_types[0] if original_axis_types else None
+  if outer_size == 1:
+    kwargs = {"axis_types": (axis_type,)} if axis_type is not None else {}
+    return jax.sharding.Mesh(devices.reshape(ep_size), (_TE_EP_AXIS,), **kwargs)
+  kwargs = {"axis_types": (axis_type, axis_type)} if axis_type is not None else {}
+  return jax.sharding.Mesh(
+      devices.reshape(outer_size, ep_size),
+      (_TE_EP_OUTER_AXIS, _TE_EP_AXIS),
+      **kwargs,
+  )
 
 
 def select_te_ep_outer_axis(mesh: jax.sharding.Mesh) -> str | None:
@@ -139,12 +178,11 @@ def _build_mesh_resource(outer_axis: str | None, ep_axis: str, tensor_axis: str 
   """
   from transformer_engine.jax.sharding import MeshResource  # pylint: disable=import-outside-toplevel
 
-  kwargs: dict[str, Any] = {
-      "fsdp_resource": "fsdp",
-      "ep_resource": ep_axis,
-  }
+  kwargs: dict[str, Any] = {"ep_resource": ep_axis}
   if outer_axis == "data":
     kwargs["dp_resource"] = "data"
+  elif outer_axis is not None:
+    kwargs["fsdp_resource"] = outer_axis
   if tensor_axis is not None:
     kwargs["tp_resource"] = tensor_axis
   return MeshResource(**kwargs)
@@ -259,12 +297,33 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
 
   Pure function; tests can call this without triggering ``ep_bootstrap``.
   """
-  ep_size = _mesh_axis_size(mesh, _TE_EP_AXIS)
-  outer_axis = select_te_ep_outer_axis(mesh)
-  outer_size = _mesh_axis_size(mesh, outer_axis) if outer_axis is not None else 1
-  tensor_size = int(mesh.shape.get("tensor", 1))
-  tensor_axis = "tensor" if tensor_size > 1 else None
-  _validate_v1_mesh(mesh, outer_axis, tensor_axis)
+  dense_tensor_size = int(mesh.shape.get("tensor", 1))
+  requested_etp = int(getattr(config, "te_ep_expert_tensor_parallelism", 0))
+  if requested_etp not in (0, 1):
+    raise ValueError(
+        "te_ep_expert_tensor_parallelism must be 0 (inherit dense TP) or 1; "
+        f"got {requested_etp}."
+    )
+
+  dense_outer_axis = select_te_ep_outer_axis(mesh)
+  dense_tensor_axis = "tensor" if dense_tensor_size > 1 else None
+  _validate_v1_mesh(mesh, dense_outer_axis, dense_tensor_axis)
+
+  uses_folded_mesh = requested_etp == 1 and dense_tensor_size > 1
+  if uses_folded_mesh:
+    te_mesh = _build_etp1_mesh(mesh)
+    ep_size = _mesh_axis_size(te_mesh, _TE_EP_AXIS)
+    outer_axis = _TE_EP_OUTER_AXIS
+    outer_size = _mesh_axis_size(te_mesh, outer_axis)
+    tensor_axis = None
+    tensor_size = 1
+  else:
+    te_mesh = mesh
+    ep_size = _mesh_axis_size(mesh, _TE_EP_AXIS)
+    outer_axis = dense_outer_axis
+    outer_size = _mesh_axis_size(mesh, outer_axis) if outer_axis is not None else 1
+    tensor_axis = dense_tensor_axis
+    tensor_size = dense_tensor_size
 
   if int(config.num_experts) % ep_size != 0:
     raise ValueError(
@@ -348,6 +407,8 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       ep_size,
       tensor_axis,
       tensor_size,
+      dense_tensor_size,
+      uses_folded_mesh,
       expected_world_size,
       int(config.num_experts),
       int(config.num_experts_per_tok),
@@ -364,6 +425,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   )
 
   return TeEpState(
+      mesh=te_mesh,
       mesh_resource=_build_mesh_resource(outer_axis, _TE_EP_AXIS, tensor_axis),
       ep_axis=_TE_EP_AXIS,
       outer_axis=outer_axis,
@@ -371,6 +433,8 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       ep_size=ep_size,
       tensor_axis=tensor_axis,
       tensor_size=tensor_size,
+      dense_tensor_size=dense_tensor_size,
+      uses_folded_mesh=uses_folded_mesh,
       expected_world_size=expected_world_size,
       num_experts=int(config.num_experts),
       num_local_experts=num_local_experts,
@@ -435,16 +499,16 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   rank = jax.process_index()
   if world_size != candidate.expected_world_size:
     raise ValueError(
-        "TE EP v1 expects one JAX process per active fsdp/expert/tensor mesh slot. "
+        "TE EP v1 expects one JAX process per active expert-view mesh slot. "
         f"process_count={world_size}, expected={candidate.expected_world_size}, "
         f"outer_axis={candidate.outer_axis}, ep_size={candidate.ep_size}, "
-        f"tensor_axis={candidate.tensor_axis}, tensor_size={candidate.tensor_size}."
+        f"expert_tensor_size={candidate.tensor_size}, dense_tensor_size={candidate.dense_tensor_size}."
     )
 
   from transformer_engine.jax.ep import ep_bootstrap  # pylint: disable=import-outside-toplevel
   from transformer_engine.jax.sharding import global_shard_guard  # pylint: disable=import-outside-toplevel
 
-  with mesh, jax.set_mesh(mesh), global_shard_guard(candidate.mesh_resource):
+  with candidate.mesh, jax.set_mesh(candidate.mesh), global_shard_guard(candidate.mesh_resource):
     # TE EP branch pr-3036 signature: ep_size is derived internally from the
     # mesh (MeshResource.ep_resource, set in _build_mesh_resource), so it is no
     # longer passed explicitly. That branch also dropped the separate
@@ -466,7 +530,8 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       "TE EP bootstrapped: "
       f"outer_axis={candidate.outer_axis}, ep_axis={candidate.ep_axis}, "
       f"ep_size={candidate.ep_size}, outer_size={candidate.outer_size}, "
-      f"tensor_axis={candidate.tensor_axis}, tensor_size={candidate.tensor_size}, "
+      f"tensor_axis={candidate.tensor_axis}, expert_tensor_size={candidate.tensor_size}, "
+      f"dense_tensor_size={candidate.dense_tensor_size}, folded_mesh={candidate.uses_folded_mesh}, "
       f"num_moe_layers={candidate.num_moe_layers}, "
       f"max_tokens_per_rank={candidate.max_tokens_per_rank}, "
       f"recv_capacity_per_rank={candidate.recv_capacity_per_rank}, "

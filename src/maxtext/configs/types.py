@@ -749,6 +749,13 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use TransformerEngine NCCL EP for MoE dispatch/combine (NVLink domain, GPU only).",
   )
+  te_ep_expert_tensor_parallelism: int = Field(
+      0,
+      description=(
+          "Expert tensor parallel size for TE EP. 0 preserves the legacy behavior and inherits dense ICI TP; "
+          "1 keeps complete expert weights and folds dense TP into the expert-data-parallel view."
+      ),
+  )
   hybrid_ep_pad_multiple: int = Field(
       128,
       description="Padding alignment for hybridEP expert GEMMs. DeepEP pads each expert's tokens to this multiple. Must be 128 for te_mxfp8.",
@@ -2347,6 +2354,23 @@ class MaxTextConfig(
       else:
         raise NotImplementedError(f"Custom mesh config file not found at {custom_mesh_path}")
 
+    if self.use_te_ep and self.te_ep_expert_tensor_parallelism == 1:
+      # Megatron-style ETP1 keeps H replicated at the MoE boundary and uses the
+      # dense tensor axis as sequence parallelism.  The TE EP mesh later folds
+      # that axis into expert-DP instead of exposing it as tp_resource.
+      etp1_rule_overrides = {
+          "activation_norm_length": ["tensor", "tensor_sequence", "context", "sequence"],
+          "activation_norm_length_moe": ["tensor", "tensor_sequence", "context", "sequence"],
+          "activation_embed": ["tensor_transpose"],
+          "activation_embed_moe": ["tensor_transpose"],
+          "activation_mlp_moe": [],
+          "norm": ["tensor_transpose"],
+      }
+      self.logical_axis_rules = [
+          (logical_axis, etp1_rule_overrides.get(logical_axis, mesh_axes))
+          for logical_axis, mesh_axes in self.logical_axis_rules
+      ]
+
     # A. SET RUN NAME AND PATHS
     # If run_name is not set, generate one from the JOBSET_NAME environment variable (if available)
     # or create one from the model name and a timestamp.
@@ -2855,6 +2879,12 @@ class MaxTextConfig(
           raise ValueError(
               "use_te_ep=True currently supports only ici_tensor_parallelism 1 or 2 for v1; "
               f"got ici_tensor_parallelism={self.ici_tensor_parallelism}."
+          )
+        if self.te_ep_expert_tensor_parallelism not in (0, 1):
+          raise ValueError(
+              "use_te_ep=True currently supports te_ep_expert_tensor_parallelism=0 "
+              "(inherit dense TP) or 1 (complete experts); "
+              f"got {self.te_ep_expert_tensor_parallelism}."
           )
         unsupported_tensor_parallel_axes = {
             "dcn_tensor_parallelism": self.dcn_tensor_parallelism,

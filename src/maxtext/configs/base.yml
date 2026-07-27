@@ -211,6 +211,7 @@ use_custom_sort_vjp: true # whether to use a custom VJP sort for efficient backw
 use_ring_of_experts: false # whether to use ring of experts for sparse matmul expert parallelism
 use_hybrid_ep: false # whether to use DeepEP hybridEP for MoE dispatch/combine (NVLink domain, GPU only)
 use_te_ep: false # whether to use TransformerEngine NCCL EP for MoE dispatch/combine (NVLink domain, GPU only)
+te_ep_expert_tensor_parallelism: 0 # 0 inherits dense TP (legacy); 1 keeps full experts and folds dense TP into expert-DP
 hybrid_ep_pad_multiple: 128 # padding alignment for hybridEP expert GEMMs (128 required for te_mxfp8)
 te_ep_recv_capacity_factor: 1.0 # multiplier on TE EP worst-case recv_capacity_per_rank
 te_ep_drop_on_overflow: false # PR3277: drop recv slots beyond capacity instead of trapping; telemetry still reports pre-drop demand

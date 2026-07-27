@@ -404,7 +404,13 @@ class RoutedMoE(nnx.Module):
         self.config.emb_dim if self.config.moe_expert_input_dim <= 0 else self.config.moe_expert_input_dim
     )
 
-    if self.config.shard_exp_on_fsdp:
+    if self.config.use_te_ep and self.config.te_ep_expert_tensor_parallelism == 1:
+      # ETP1 owns complete expert matrices on every expert rank.  The dense
+      # tensor axis is sequence parallelism / expert-DP at the MoE boundary,
+      # not an expert weight-sharding axis.
+      self.wi_kernel_axes = ("exp", None, None)
+      self.wo_kernel_axes = ("exp", None, None)
+    elif self.config.shard_exp_on_fsdp:
       # special sharding for dsv3
       self.wi_kernel_axes = ("embed_moe", None, "mlp_moe")
       self.wo_kernel_axes = ("embed_moe", "mlp_moe", None)
@@ -1618,6 +1624,14 @@ class RoutedMoE(nnx.Module):
       w0_pspec = self._logical_to_mesh_axes(("exp", "embed_tensor_transpose", "mlp_no_fsdp"))
       w1_pspec = self._logical_to_mesh_axes(("exp", "embed_tensor_transpose", "mlp_no_fsdp"))
       wo_pspec = self._logical_to_mesh_axes(("exp", "mlp_no_fsdp", "embed_tensor_transpose"))
+    if self.config.use_te_ep and self.config.te_ep_expert_tensor_parallelism == 1:
+      w0_pspec = P("expert", None, None)
+      w1_pspec = P("expert", None, None)
+      wo_pspec = P("expert", None, None)
+      w0_bias_pspec = P("expert", None)
+      w1_bias_pspec = P("expert", None)
+      wo_bias_pspec = P("expert", None)
+      weight_gather = False
     if isinstance(w0_kernel, aqt.QTensor):
       w0_pspec = aqt.partition_spec(w0_pspec, (1,), w0_kernel.dtype, use_bias=False)
     if isinstance(w1_kernel, aqt.QTensor):
@@ -2091,10 +2105,10 @@ class RoutedMoE(nnx.Module):
       top_k_indices_2d = top_k_indices.reshape(num_local_tokens, -1).astype(jnp.int32)
       weights_2d = weights.reshape(num_local_tokens, -1).astype(jnp.float32)
 
-      input_sharding = NamedSharding(self.mesh, state.input_spec_2d)
-      routing_sharding = NamedSharding(self.mesh, state.routing_spec_2d)
-      ep_sharding_2d = NamedSharding(self.mesh, state.ep_spec_2d)
-      ep_sharding_3d = NamedSharding(self.mesh, state.ep_spec_3d)
+      input_sharding = NamedSharding(state.mesh, state.input_spec_2d)
+      routing_sharding = NamedSharding(state.mesh, state.routing_spec_2d)
+      ep_sharding_2d = NamedSharding(state.mesh, state.ep_spec_2d)
+      ep_sharding_3d = NamedSharding(state.mesh, state.ep_spec_3d)
 
       x_2d = jax.lax.with_sharding_constraint(x_2d, input_sharding)
       top_k_indices_2d = jax.lax.with_sharding_constraint(top_k_indices_2d, routing_sharding)
@@ -2109,7 +2123,7 @@ class RoutedMoE(nnx.Module):
           top_k=self.num_experts_per_tok,
           dispatch_output_per_expert_alignment=int(state.dispatch_alignment),
       )
-      with self.mesh, global_shard_guard(state.mesh_resource):
+      with state.mesh, global_shard_guard(state.mesh_resource):
         recv_tokens, recv_weights, handle, token_counts, total_recv_tokens = ep_dispatch(
             ep_cfg,
             top_k_indices_2d,
@@ -2128,7 +2142,7 @@ class RoutedMoE(nnx.Module):
 
       @functools.partial(
           jax.shard_map,
-          mesh=self.mesh,
+          mesh=state.mesh,
           in_specs=(
               state.ep_spec_3d,
               state.ep_spec_2d,
@@ -2269,7 +2283,7 @@ class RoutedMoE(nnx.Module):
         # its internal weighted = expert_out * w * mask path is exercised
         # (matches OLD TE EP path that worked at ~427 TFLOP/s on job 1949999).
         intermediate_output = gmm_fn(intermediate_layer, wo, tiling=wo_tile_size, weight_gather_axes=wo_gather_axes)
-        if self.get_tensor_parallelism_size() > 1:
+        if state.tensor_size > 1:
           intermediate_output = jax.lax.psum_scatter(
               intermediate_output, self._tensor_parallelism_name, scatter_dimension=1, tiled=True
           )
@@ -2292,7 +2306,7 @@ class RoutedMoE(nnx.Module):
       if expert_out.dtype != jnp.bfloat16:
         expert_out = expert_out.astype(jnp.bfloat16)
 
-      with self.mesh, global_shard_guard(state.mesh_resource):
+      with state.mesh, global_shard_guard(state.mesh_resource):
         output = ep_combine(
             ep_cfg,
             handle,
