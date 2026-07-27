@@ -273,7 +273,7 @@ def _get_nontrival_mesh_axes(mesh):
   return {axis for axis in target_sharding_axes_config if axis in mesh.axis_names and mesh.shape[axis] > 1}
 
 
-def _analyze_sharding(params, mesh, valid_target_mesh_axes):
+def _analyze_sharding(params, mesh, valid_target_mesh_axes, required_mesh_axes_by_path=None):
   """
   Analyzes parameters to find which are unsharded on any valid mesh axis.
 
@@ -285,6 +285,9 @@ def _analyze_sharding(params, mesh, valid_target_mesh_axes):
     params: A PyTree of model parameters.
     mesh: The device mesh object.
     valid_target_mesh_axes: A set of mesh axis names that are considered valid targets for sharding.
+    required_mesh_axes_by_path: Optional callable from parameter path string to
+      the mesh axes required for that parameter. Returning None uses all valid
+      target axes.
 
   Returns:
     A tuple containing:
@@ -313,13 +316,18 @@ def _analyze_sharding(params, mesh, valid_target_mesh_axes):
     current_sharding_spec = p_leaf.sharding.spec  # Extract the current tensor's sharding spec
     # Identify axes used for sharding
     mesh_axes_used = get_mesh_axes_used_by_tensor_spec(current_sharding_spec)
-    # Check if the parameter is sharded on all the valid target axes.
-    is_sharded_on_all_target_axis = all(axis in mesh_axes_used for axis in valid_target_mesh_axes)
+    required_mesh_axes = valid_target_mesh_axes
+    if required_mesh_axes_by_path is not None:
+      path_specific_axes = required_mesh_axes_by_path(param_name_str)
+      if path_specific_axes is not None:
+        required_mesh_axes = set(path_specific_axes)
+    # Check if the parameter is sharded on all axes required for its layout.
+    is_sharded_on_all_target_axis = all(axis in mesh_axes_used for axis in required_mesh_axes)
 
     # If the parameter is not sharded on all of the target axes, it's considered "problematic."
     if not is_sharded_on_all_target_axis:
       unsharded_params_total_size += p_leaf.size  # Add to total unsharded parameter size
-      unsharded_axes = set(valid_target_mesh_axes) - set(mesh_axes_used)
+      unsharded_axes = set(required_mesh_axes) - set(mesh_axes_used)
       # Add detailed info to list of problematic tensors
       problematic_tensors_details.append(
           {
@@ -327,7 +335,7 @@ def _analyze_sharding(params, mesh, valid_target_mesh_axes):
               "size": p_leaf.size,  # tensor size
               "shape": p_leaf.shape,  # tensor shape
               "spec": str(current_sharding_spec),  # Tensor sharding spec as string
-              "available_axes": sorted(list(valid_target_mesh_axes)),  # Axes that could be used for sharding
+              "available_axes": sorted(list(required_mesh_axes)),  # Axes required for this parameter layout
               "unsharded_axes": sorted(list(unsharded_axes)),  # Unsharded axes
           }
       )
@@ -385,7 +393,7 @@ def _raise_if_unsharded_exceeds_tolerance(unsharded_size, total_size, tolerance,
     raise AssertionError("\n".join(error_msg_lines))
 
 
-def assert_params_sufficiently_sharded(params, mesh, tolerance):
+def assert_params_sufficiently_sharded(params, mesh, tolerance, required_mesh_axes_by_path=None):
   """
   Asserts that the total size of replicated parameters is within a given tolerance.
 
@@ -398,6 +406,8 @@ def assert_params_sufficiently_sharded(params, mesh, tolerance):
     params: A PyTree of model parameters.
     mesh: The device mesh object.
     tolerance: A float representing the maximum allowed percentage of unsharded parameters.
+    required_mesh_axes_by_path: Optional callable from parameter path string to
+      a path-specific set of required mesh axes.
   """
   # Calculate the total size of all parameters in the model.
   total_num_params = max_utils.calculate_bytes_from_pytree(params)
@@ -410,7 +420,12 @@ def assert_params_sufficiently_sharded(params, mesh, tolerance):
 
   # Analyze the parameters to find the total size of unsharded parameters
   # and get details on which tensors are problematic.
-  unsharded_params_total_size, problematic_tensors_details = _analyze_sharding(params, mesh, valid_target_mesh_axes)
+  unsharded_params_total_size, problematic_tensors_details = _analyze_sharding(
+      params,
+      mesh,
+      valid_target_mesh_axes,
+      required_mesh_axes_by_path=required_mesh_axes_by_path,
+  )
 
   # Check if the amount of unsharded parameters is within the tolerance and
   # raise an exception if it is not.

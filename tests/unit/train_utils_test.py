@@ -18,7 +18,11 @@ import unittest
 from dataclasses import dataclass
 from unittest.mock import MagicMock
 
-from maxtext.utils.train_utils import validate_train_config, create_training_optimizer
+from maxtext.utils.train_utils import (
+    create_training_optimizer,
+    te_ep_etp1_required_mesh_axes,
+    validate_train_config,
+)
 
 
 @dataclass
@@ -110,6 +114,22 @@ class TestValidateTrainConfig(unittest.TestCase):
     """Verifies no exception for local base_output_directory (just logs a warning)."""
     config = MockConfig(base_output_directory="/local/output")
     validate_train_config(config)  # Should not raise
+
+
+class TestEtp1ParameterShardingRequirements(unittest.TestCase):
+  """Tests path-specific sharding requirements for routed experts."""
+
+  def test_fused_routed_expert_weight_requires_only_expert_axis(self):
+    path = "['params']['decoder']['moe_layers']['MoeBlock_0']['wi']"
+    self.assertEqual(te_ep_etp1_required_mesh_axes(path), {"expert"})
+
+  def test_unfused_routed_expert_weight_requires_only_expert_axis(self):
+    path = "['params']['decoder']['moe_layers']['MoeBlock_0']['wi_0']"
+    self.assertEqual(te_ep_etp1_required_mesh_axes(path), {"expert"})
+
+  def test_attention_parameter_uses_default_requirements(self):
+    path = "['params']['decoder']['moe_layers']['self_attention']['wq_a']['kernel']"
+    self.assertIsNone(te_ep_etp1_required_mesh_axes(path))
 
 
 class TestCreateTrainingOptimizer(unittest.TestCase):

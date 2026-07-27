@@ -43,6 +43,18 @@ def create_training_optimizer(config, model):
   return learning_rate_schedule, tx
 
 
+def te_ep_etp1_required_mesh_axes(param_name: str) -> set[str] | None:
+  """Return the required mesh axes for an ETP1 routed-expert parameter."""
+  routed_expert_params = ("wi", "wi_0", "wi_1", "wo", "wi_0_bias", "wi_1_bias", "wo_bias")
+  if "MoeBlock_" not in param_name:
+    return None
+  if any(f"['{name}']" in param_name for name in routed_expert_params):
+    # Complete experts are partitioned by EP and intentionally replicated over
+    # expert-DP. Dense/attention parameters retain the normal strict check.
+    return {"expert"}
+  return None
+
+
 def create_checkpoint_manager(config, mesh, init_state_fn):
   """Creates the init_rng, optimizer, learning rate schedule, and checkpoint manager."""
   # pass in model for muon
@@ -270,7 +282,17 @@ def setup_train_loop(config, recorder, devices=None):
     # TODO(aireenmei, hengtaoguo): support sharding in vit for multimodal
     if not config.using_pipeline_parallelism and not config.use_multimodal:
       # The vocab tensor(s) of shape [vocab, embed] (and transpose) are not sharded by stage
-      sharding.assert_params_sufficiently_sharded(state.params, mesh, config.sharding_tolerance)
+      required_mesh_axes_by_path = (
+          te_ep_etp1_required_mesh_axes
+          if bool(config.use_te_ep) and int(config.te_ep_expert_tensor_parallelism) == 1
+          else None
+      )
+      sharding.assert_params_sufficiently_sharded(
+          state.params,
+          mesh,
+          config.sharding_tolerance,
+          required_mesh_axes_by_path=required_mesh_axes_by_path,
+      )
 
     # print weights sharding info under debug sharding mode
     if config.debug_sharding:
