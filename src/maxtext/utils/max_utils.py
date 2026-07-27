@@ -1116,6 +1116,20 @@ def dummy_context_manager():
   yield
 
 
+def _transformer_engine_mesh_resource_kwargs(config=None) -> dict[str, str | None]:
+  """Build TE mesh-resource roles without importing Transformer Engine."""
+  use_te_ep = getattr(config, "use_te_ep", False)
+  use_te_ep_etp1 = use_te_ep and int(getattr(config, "te_ep_expert_tensor_parallelism", 0)) == 1
+  return {
+      "dp_resource": "tensor" if use_te_ep_etp1 else None if use_te_ep else "data",
+      "tp_resource": None if use_te_ep else "tensor",
+      "fsdp_resource": None if use_te_ep_etp1 else "fsdp",
+      "pp_resource": None,
+      "cp_resource": None if use_te_ep else "context",
+      "ep_resource": "expert" if use_te_ep else None,
+  }
+
+
 @contextmanager
 def transformer_engine_context(config=None):
   """If TransformerEngine is available, this context manager will provide
@@ -1123,24 +1137,14 @@ def transformer_engine_context(config=None):
 
   When ``config.use_te_ep`` is true, ``ep_resource="expert"`` is added so
   TE NCCL EP's custom_partitioning can resolve the EP axis at lowering time.
-  ``tp_resource`` / ``cp_resource`` / ``dp_resource`` are set to ``None`` so
-  TE picks ``fsdp_resource`` as the outer companion to ``ep_resource``.  The
-  TE EP MoE wrapper re-enters a mesh-scoped guard with ``tp_resource`` only
-  around ``ep_dispatch``/``ep_combine`` when ICI TP is active.
+  Legacy expert TP uses ``fsdp_resource`` as EP's outer companion. Megatron-
+  style ETP1 instead maps the dense ``tensor`` axis to ``dp_resource`` so the
+  same physical mesh is viewed as expert-DP × EP during TE lowering.
   """
   try:
     from transformer_engine.jax.sharding import global_shard_guard, MeshResource  # pylint: disable=import-outside-toplevel
-    use_te_ep = getattr(config, "use_te_ep", False)
     # Inform TransformerEngine of MaxText's physical mesh resources.
-    mesh_resource = MeshResource(  # pytype: disable=wrong-arg-types
-        dp_resource=None if use_te_ep else "data",
-        tp_resource=None if use_te_ep else "tensor",
-        # tpsp_resource = "tensor_sequence", #TODO(Phuong): add this back when upstreaming CGEMM
-        fsdp_resource="fsdp",
-        pp_resource=None,
-        cp_resource=None if use_te_ep else "context",
-        ep_resource="expert" if use_te_ep else None,
-    )
+    mesh_resource = MeshResource(**_transformer_engine_mesh_resource_kwargs(config))
     with global_shard_guard(mesh_resource):
       yield
   except (ImportError, AttributeError):
