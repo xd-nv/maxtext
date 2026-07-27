@@ -2109,6 +2109,8 @@ class RoutedMoE(nnx.Module):
       routing_sharding = NamedSharding(state.mesh, state.routing_spec_2d)
       ep_sharding_2d = NamedSharding(state.mesh, state.ep_spec_2d)
       ep_sharding_3d = NamedSharding(state.mesh, state.ep_spec_3d)
+      compute_ep_sharding_2d = NamedSharding(self.mesh, state.compute_ep_spec_2d)
+      compute_ep_sharding_3d = NamedSharding(self.mesh, state.compute_ep_spec_3d)
 
       x_2d = jax.lax.with_sharding_constraint(x_2d, input_sharding)
       top_k_indices_2d = jax.lax.with_sharding_constraint(top_k_indices_2d, routing_sharding)
@@ -2140,13 +2142,20 @@ class RoutedMoE(nnx.Module):
         # intermediate for train-step aggregation.
         self.sow(nnx.Intermediate, "te_ep_total_recv_tokens", total_recv_tokens)
 
+      # The folded TE mesh and the original dense mesh assign the same device
+      # shards; only their axis names differ. Re-express the dispatch outputs in
+      # the original mesh so shard_map matches the ambient compilation mesh.
+      compute_recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, compute_ep_sharding_3d)
+      compute_recv_weights = jax.lax.with_sharding_constraint(recv_weights, compute_ep_sharding_2d)
+      compute_token_counts = jax.lax.with_sharding_constraint(token_counts, compute_ep_sharding_2d)
+
       @functools.partial(
           jax.shard_map,
-          mesh=state.mesh,
+          mesh=self.mesh,
           in_specs=(
-              state.ep_spec_3d,
-              state.ep_spec_2d,
-              state.ep_spec_2d,
+              state.compute_ep_spec_3d,
+              state.compute_ep_spec_2d,
+              state.compute_ep_spec_2d,
               w0_pspec,
               w1_pspec,
               wo_pspec,
@@ -2154,7 +2163,7 @@ class RoutedMoE(nnx.Module):
               w1_bias_pspec,
               wo_bias_pspec,
           ),
-          out_specs=state.ep_spec_3d,
+          out_specs=state.compute_ep_spec_3d,
           check_vma=False,
       )
       def te_ep_expert_compute(recv_t, recv_w, tc, w0, w1, wo, w0_bias, w1_bias, wo_bias):
@@ -2301,12 +2310,21 @@ class RoutedMoE(nnx.Module):
         return intermediate_output.reshape(recv_t_local_shape)
 
       expert_out = te_ep_expert_compute(
-          recv_tokens, recv_weights, token_counts, w0, w1, wo, w0_bias, w1_bias, wo_bias
+          compute_recv_tokens,
+          compute_recv_weights,
+          compute_token_counts,
+          w0,
+          w1,
+          wo,
+          w0_bias,
+          w1_bias,
+          wo_bias,
       )
       if expert_out.dtype != jnp.bfloat16:
         expert_out = expert_out.astype(jnp.bfloat16)
 
       with state.mesh, global_shard_guard(state.mesh_resource):
+        expert_out = jax.lax.with_sharding_constraint(expert_out, ep_sharding_3d)
         output = ep_combine(
             ep_cfg,
             handle,

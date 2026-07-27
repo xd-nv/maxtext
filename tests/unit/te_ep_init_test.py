@@ -207,6 +207,7 @@ class BuildTeEpStateTest(unittest.TestCase):
     self.assertEqual(state.max_tokens_per_rank, 4096)
     self.assertEqual(state.routing_spec_2d, te_ep_init.PartitionSpec(("fsdp", "expert"), None))
     self.assertEqual(state.input_spec_2d, te_ep_init.PartitionSpec(("fsdp", "expert"), "tensor"))
+    self.assertEqual(state.compute_ep_spec_3d, state.ep_spec_3d)
 
   def test_etp1_folds_dense_tensor_into_expert_data_parallelism(self):
     config = self._config()
@@ -234,6 +235,10 @@ class BuildTeEpStateTest(unittest.TestCase):
     self.assertEqual(state.max_tokens_per_rank, 2048)
     self.assertEqual(state.routing_spec_2d, te_ep_init.PartitionSpec(("te_ep_outer", "expert"), None))
     self.assertEqual(state.input_spec_2d, te_ep_init.PartitionSpec(("te_ep_outer", "expert"), None))
+    self.assertEqual(
+        state.compute_ep_spec_3d,
+        te_ep_init.PartitionSpec(("fsdp", "tensor", "expert"), None, None),
+    )
 
   def test_etp1_rank_mapping_preserves_existing_ep_groups(self):
     devices = np.arange(2 * 8 * 2).reshape(2, 8, 2)

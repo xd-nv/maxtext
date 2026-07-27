@@ -89,6 +89,8 @@ class TeEpState:
   input_spec_3d: PartitionSpec
   ep_spec_2d: PartitionSpec
   ep_spec_3d: PartitionSpec
+  compute_ep_spec_2d: PartitionSpec
+  compute_ep_spec_3d: PartitionSpec
   config_key: tuple[Any, ...]
 
 
@@ -400,6 +402,22 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
 
   leading_spec: Any = (outer_axis, _TE_EP_AXIS) if outer_axis is not None else _TE_EP_AXIS
   hidden_spec: Any = tensor_axis
+  if uses_folded_mesh:
+    original_axis_names = tuple(getattr(mesh, "axis_names", tuple(mesh.shape.keys())))
+    compute_leading_axes = [
+        axis
+        for axis in original_axis_names
+        if axis != _TE_EP_AXIS and int(mesh.shape[axis]) > 1
+    ]
+    compute_leading_axes.append(_TE_EP_AXIS)
+    compute_leading_spec: Any = (
+        compute_leading_axes[0] if len(compute_leading_axes) == 1 else tuple(compute_leading_axes)
+    )
+    compute_ep_spec_2d = PartitionSpec(compute_leading_spec, None)
+    compute_ep_spec_3d = PartitionSpec(compute_leading_spec, None, None)
+  else:
+    compute_ep_spec_2d = PartitionSpec(leading_spec, None)
+    compute_ep_spec_3d = PartitionSpec(leading_spec, None, hidden_spec)
   config_key = (
       _TE_EP_AXIS,
       outer_axis,
@@ -453,6 +471,8 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       input_spec_3d=PartitionSpec(leading_spec, None, hidden_spec),
       ep_spec_2d=PartitionSpec(leading_spec, None),
       ep_spec_3d=PartitionSpec(leading_spec, None, hidden_spec),
+      compute_ep_spec_2d=compute_ep_spec_2d,
+      compute_ep_spec_3d=compute_ep_spec_3d,
       config_key=config_key,
   )
 
