@@ -49,6 +49,30 @@ _A_SCALE = "a_scale"  # Clipping scale for activations
 _TILE_SIZE = "tile_size"  # Tile size for subchannel
 
 
+def _flatten_etp1_te_dense_input(x, contracting_dims):
+  """Collapse token-leading dimensions before TE Dense."""
+  x_contracting_dims, kernel_contracting_dims = contracting_dims
+  x_contracting_dims = tuple(dim % x.ndim for dim in x_contracting_dims)
+  num_contracting_dims = len(x_contracting_dims)
+  if num_contracting_dims == 0:
+    return x, contracting_dims, None
+
+  expected_suffix = tuple(range(x.ndim - num_contracting_dims, x.ndim))
+  num_leading_dims = x.ndim - num_contracting_dims
+  if x_contracting_dims != expected_suffix or num_leading_dims <= 1:
+    return x, contracting_dims, None
+
+  leading_shape = x.shape[:num_leading_dims]
+  contracting_shape = x.shape[num_leading_dims:]
+  flattened = x.reshape((-1, *contracting_shape))
+  flattened_contracting_dims = tuple(range(1, 1 + num_contracting_dims))
+  return (
+      flattened,
+      (flattened_contracting_dims, kernel_contracting_dims),
+      leading_shape,
+  )
+
+
 @dataclass
 class Quantization:
   """Base class for quantization configurations"""
@@ -836,14 +860,22 @@ class TransformerEngineQuantization(Quantization):
       raise ValueError(f"Invalid TransformerEngine quantization config: {config.quantization}")
 
     self._recipe = TransformerEngineQuantization._get_recipe(config.quantization)
+    self._flatten_etp1_token_dims = bool(
+        getattr(config, "use_te_ep", False)
+        and int(getattr(config, "te_ep_expert_tensor_parallelism", 0)) == 1
+    )
 
   def __hash__(self):
-    return hash((self.quant_mode, self._recipe))
+    return hash((self.quant_mode, self._recipe, self._flatten_etp1_token_dims))
 
   def __eq__(self, other):
     if not isinstance(other, TransformerEngineQuantization):
       return False
-    return (self.quant_mode, self._recipe) == (other.quant_mode, other._recipe)
+    return (self.quant_mode, self._recipe, self._flatten_etp1_token_dims) == (
+        other.quant_mode,
+        other._recipe,
+        other._flatten_etp1_token_dims,
+    )
 
   @staticmethod
   def _get_recipe(recipe_name: str):
@@ -930,17 +962,26 @@ class TransformerEngineQuantization(Quantization):
     """Placeholder for dot_general implementation in subclasses."""
     import transformer_engine.jax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
 
+    flatten_etp1_token_dims = self._flatten_etp1_token_dims
+
     def te_dot_general(generate_quantizer_set, x, kernel, dims, **kwargs):
       contracting_dims, batch_dims = dims
       assert batch_dims == ((), ()), "Batch dimensions must be empty for TransformerEngine dot."
 
+      leading_shape = None
+      if flatten_etp1_token_dims:
+        x, contracting_dims, leading_shape = _flatten_etp1_te_dense_input(x, contracting_dims)
+
       quantizer_set = generate_quantizer_set()
-      return transformer_engine.jax.dense.dense(
+      output = transformer_engine.jax.dense.dense(
           x,
           kernel,
           contracting_dims=contracting_dims,
           quantizer_set=quantizer_set,
       )
+      if leading_shape is not None:
+        output = output.reshape((*leading_shape, *output.shape[1:]))
+      return output
 
     return self._wrap(te_dot_general, "dot_general")
 

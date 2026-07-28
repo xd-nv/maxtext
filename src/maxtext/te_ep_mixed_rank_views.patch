@@ -147,54 +147,22 @@ diff --git a/transformer_engine/jax/ep.py b/transformer_engine/jax/ep.py
 diff --git a/transformer_engine/jax/cpp_extensions/gemm.py b/transformer_engine/jax/cpp_extensions/gemm.py
 --- a/transformer_engine/jax/cpp_extensions/gemm.py
 +++ b/transformer_engine/jax/cpp_extensions/gemm.py
-@@ -913,13 +913,28 @@ class GemmPrimitive(BasePrimitive):
-             (lhs_non_cdims, lhs_cdims, rhs_non_cdims, rhs_cdims),
-         )
- 
--        reduce_spec = None
-+        reduce_specs = []
-         for l in lhs_cspecs:
-             for r in rhs_cspecs:
-                 if l is not None and l == r:
--                    if reduce_spec is not None:
--                        raise RuntimeError("Multiple reduce dimension is detected!")
--                    reduce_spec = l
-+                    if l not in reduce_specs:
-+                        reduce_specs.append(l)
-+
-+        reduce_axes = []
-+        for spec in reduce_specs:
-+            axes = spec if isinstance(spec, tuple) else (spec,)
-+            for axis in axes:
-+                if axis not in reduce_axes:
-+                    reduce_axes.append(axis)
-+        reduce_spec = (
-+            None
-+            if not reduce_axes
-+            else reduce_axes[0] if len(reduce_axes) == 1 else tuple(reduce_axes)
-+        )
-+
-+        def is_reduce_spec(spec):
-+            axes = spec if isinstance(spec, tuple) else (spec,)
-+            return spec is not None and all(axis in reduce_axes for axis in axes)
- 
-         sequence_dim = None
- 
-@@ -952,14 +967,14 @@ class GemmPrimitive(BasePrimitive):
- 
-         if reduce_spec is not None:
-             # Other non-reduce cdims (if exists) need to be unsharded
--            lhs_cspecs = tuple(s if s == reduce_spec else None for s in lhs_cspecs)
-+            lhs_cspecs = tuple(s if is_reduce_spec(s) else None for s in lhs_cspecs)
-             # Only do AG Sequence dim if not Overlap
-             if collective_op.is_all_gather:
-                 rhs_cspecs = tuple(
--                    s if s in (reduce_spec, gsr.tpsp_resource) else None for s in rhs_cspecs
-+                    s if is_reduce_spec(s) or s == gsr.tpsp_resource else None for s in rhs_cspecs
-                 )
-             else:
--                rhs_cspecs = tuple(s if s == reduce_spec else None for s in rhs_cspecs)
-+                rhs_cspecs = tuple(s if is_reduce_spec(s) else None for s in rhs_cspecs)
- 
-             # Non-contracting dims of RHS always needs to be gathered, i.e. for TP + activation_hidden
-             # No batch-dim check needed as `rhs_non_cspecs` never contains batch-dim.
+@@ -1164,11 +1164,13 @@ class GemmPrimitive(BasePrimitive):
+             if reduce_spec is not None:
+                 if not collective_op.is_reduce_scatter:
++                    reduce_axes = reduce_spec if isinstance(reduce_spec, tuple) else (reduce_spec,)
+                     if is_all_reduce_in_float32():  # For unittest only
+-                        output = jax.lax.psum(output.astype(jnp.float32), reduce_spec).astype(
+-                            out_dtype
+-                        )
++                        output = output.astype(jnp.float32)
++                        for axis in reduce_axes:
++                            output = jax.lax.psum(output, axis)
++                        output = output.astype(out_dtype)
+                     else:
+-                        output = jax.lax.psum(output, reduce_spec)
++                        for axis in reduce_axes:
++                            output = jax.lax.psum(output, axis)
+-
+                 if has_bias:
+                     output += bias

@@ -16,6 +16,7 @@
 
 import functools
 import os.path
+from pathlib import Path
 import sys
 from typing import Any
 import unittest
@@ -129,6 +130,52 @@ def _apply(quant_str=""):
 
 class QuantizationTest(unittest.TestCase):
   """Tests for quantization."""
+
+  def test_etp1_te_dense_flattens_token_leading_dimensions(self):
+    inputs = jnp.zeros((2, 3, 8), dtype=jnp.bfloat16)
+    flattened, contracting_dims, leading_shape = quantizations._flatten_etp1_te_dense_input(
+        inputs, ((2,), (0,))
+    )
+
+    self.assertEqual(flattened.shape, (6, 8))
+    self.assertEqual(contracting_dims, ((1,), (0,)))
+    self.assertEqual(leading_shape, (2, 3))
+
+  def test_etp1_te_dense_preserves_multiple_feature_dimensions(self):
+    inputs = jnp.zeros((2, 3, 4, 8), dtype=jnp.bfloat16)
+    flattened, contracting_dims, leading_shape = quantizations._flatten_etp1_te_dense_input(
+        inputs, ((2, 3), (0, 1))
+    )
+
+    self.assertEqual(flattened.shape, (6, 4, 8))
+    self.assertEqual(contracting_dims, ((1, 2), (0, 1)))
+    self.assertEqual(leading_shape, (2, 3))
+
+  def test_etp1_te_dense_leaves_2d_and_non_suffix_contracts_unchanged(self):
+    inputs_2d = jnp.zeros((3, 8), dtype=jnp.bfloat16)
+    flattened, contracting_dims, leading_shape = quantizations._flatten_etp1_te_dense_input(
+        inputs_2d, ((1,), (0,))
+    )
+    self.assertIs(flattened, inputs_2d)
+    self.assertEqual(contracting_dims, ((1,), (0,)))
+    self.assertIsNone(leading_shape)
+
+    inputs_non_suffix = jnp.zeros((2, 8, 3), dtype=jnp.bfloat16)
+    flattened, contracting_dims, leading_shape = quantizations._flatten_etp1_te_dense_input(
+        inputs_non_suffix, ((1,), (0,))
+    )
+    self.assertIs(flattened, inputs_non_suffix)
+    self.assertEqual(contracting_dims, ((1,), (0,)))
+    self.assertIsNone(leading_shape)
+
+  def test_etp1_te_patch_keeps_single_contracting_dimension_parser(self):
+    patch_path = Path(__file__).parents[2] / "src/maxtext/te_ep_mixed_rank_views.patch"
+    patch_text = patch_path.read_text(encoding="utf-8")
+
+    self.assertNotIn("reduce_specs = []", patch_text)
+    self.assertNotIn("def is_reduce_spec", patch_text)
+    self.assertIn("reduce_axes = reduce_spec if isinstance(reduce_spec, tuple)", patch_text)
+    self.assertIn("for axis in reduce_axes:", patch_text)
 
   def test_in_quant_mode(self):
     quant = _configure_quantization(quant_str="int8", mode_str="convert")
