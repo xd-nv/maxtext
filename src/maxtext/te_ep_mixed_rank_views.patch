@@ -198,24 +198,3 @@ diff --git a/transformer_engine/jax/cpp_extensions/gemm.py b/transformer_engine/
  
              # Non-contracting dims of RHS always needs to be gathered, i.e. for TP + activation_hidden
              # No batch-dim check needed as `rhs_non_cspecs` never contains batch-dim.
-@@ -1163,12 +1178,14 @@ class GemmPrimitive(BasePrimitive):
- 
-             if reduce_spec is not None:
-                 if not collective_op.is_reduce_scatter:
--                    if is_all_reduce_in_float32():  # For unittest only
--                        output = jax.lax.psum(output.astype(jnp.float32), reduce_spec).astype(
--                            out_dtype
--                        )
--                    else:
--                        output = jax.lax.psum(output, reduce_spec)
-+                    axes = reduce_spec if isinstance(reduce_spec, tuple) else (reduce_spec,)
-+                    for axis in axes:
-+                        if is_all_reduce_in_float32():  # For unittest only
-+                            output = jax.lax.psum(output.astype(jnp.float32), axis).astype(
-+                                out_dtype
-+                            )
-+                        else:
-+                            output = jax.lax.psum(output, axis)
- 
-                 if has_bias:
-                     output += bias
