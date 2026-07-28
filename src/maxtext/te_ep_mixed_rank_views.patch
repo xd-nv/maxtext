@@ -85,6 +85,10 @@ diff --git a/transformer_engine/jax/cpp_extensions/ep.py b/transformer_engine/ja
 diff --git a/transformer_engine/jax/ep.py b/transformer_engine/jax/ep.py
 --- a/transformer_engine/jax/ep.py
 +++ b/transformer_engine/jax/ep.py
+@@ -65 +65,2 @@ def _allgather_uid(uid_arr, world_size, uid_size):
+-    g_out = jax.jit(lambda x: x, out_shardings=replicated)(g_in)
++    with jax.set_mesh(mesh):
++        g_out = jax.jit(lambda x: x, out_shardings=replicated)(g_in)
 @@ -207,8 +207,15 @@ def _default_out_partition_spec():
  # ── ep_dispatch (custom_vjp) ─────────────────────────────────────────────────
  

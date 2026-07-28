@@ -174,6 +174,7 @@ class QuantizationTest(unittest.TestCase):
 
     self.assertNotIn("reduce_specs = []", patch_text)
     self.assertNotIn("def is_reduce_spec", patch_text)
+    self.assertIn("with jax.set_mesh(mesh):", patch_text)
     self.assertIn("reduce_axes = reduce_spec if isinstance(reduce_spec, tuple)", patch_text)
     self.assertIn("for axis in reduce_axes:", patch_text)
 
