@@ -356,6 +356,17 @@ class GateLogit(nnx.Module):
     return output, pre_bias_logits
 
 
+def _get_gate_quantization(config: ctypes.Config, quant: quantizations.Quantization | None):
+  """Keep the ETP1 router outside TE GEMM's single-reduction partitioner."""
+  if (
+      config.use_te_ep
+      and config.te_ep_expert_tensor_parallelism == 1
+      and isinstance(quant, quantizations.TransformerEngineQuantization)
+  ):
+    return None
+  return quant
+
+
 class RoutedMoE(nnx.Module):
   """Implements a routed MoE block."""
 
@@ -434,6 +445,13 @@ class RoutedMoE(nnx.Module):
     else:
       self._expert_parallelism_name = "expert"
 
+    # ETP1 sequence-shards tokens on dense TP while EP shards the batch.
+    # Router WGrad therefore reduces over both axes, but TE's generic GEMM
+    # custom partitioner supports only one distributed contracting axis.
+    # Megatron keeps the router outside expert FP8/GMM; use XLA dot_general
+    # for this small projection so both reductions remain legal.
+    gate_quant = _get_gate_quantization(self.config, self.quant)
+
     self.gate = GateLogit(
         in_features_shape=self.moe_expert_input_dim,
         out_features_shape=self.num_experts,
@@ -441,7 +459,7 @@ class RoutedMoE(nnx.Module):
         model_name=self.config.model_name,
         dtype=jnp.float32 if self.config.float32_gate_logits else self.dtype,
         weight_dtype=self.weight_dtype,
-        quant=self.quant,
+        quant=gate_quant,
         kernel_init=self.kernel_init,
         kernel_axes=self.kernel_axes,
         use_bias=self.config.routed_bias,

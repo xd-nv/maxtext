@@ -14,6 +14,7 @@
 """Mixture of Experts (MoE) tests."""
 
 import unittest
+from types import SimpleNamespace
 
 from flax import nnx
 import flax.linen as nn
@@ -27,10 +28,23 @@ from maxtext.layers import linears
 from maxtext.layers import moe
 from maxtext.layers import nnx_wrappers
 from maxtext.layers.initializers import NdInitializer, nd_dense_init, variable_to_logically_partitioned
-from maxtext.layers.quantizations import Fp8Quantization
+from maxtext.layers.quantizations import Fp8Quantization, TransformerEngineQuantization
 from maxtext.utils import maxtext_utils
 from tests.utils.test_helpers import get_test_config_path, get_decoupled_parallelism_overrides
 import pytest
+
+
+class GateQuantizationTest(unittest.TestCase):
+
+  def test_etp1_router_bypasses_te_gemm(self):
+    config = SimpleNamespace(use_te_ep=True, te_ep_expert_tensor_parallelism=1)
+    te_quant = object.__new__(TransformerEngineQuantization)
+    self.assertIsNone(moe._get_gate_quantization(config, te_quant))
+
+  def test_legacy_expert_tp_keeps_te_gemm(self):
+    config = SimpleNamespace(use_te_ep=True, te_ep_expert_tensor_parallelism=0)
+    te_quant = object.__new__(TransformerEngineQuantization)
+    self.assertIs(moe._get_gate_quantization(config, te_quant), te_quant)
 
 
 class TokenDroppingTest(unittest.TestCase):
