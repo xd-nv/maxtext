@@ -2130,6 +2130,7 @@ class RoutedMoE(nnx.Module):
             x_2d,
             weights_2d,
             state.recv_capacity_per_rank,
+            tuple(state.input_spec_2d),
         )
         recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, ep_sharding_3d)
         recv_weights = jax.lax.with_sharding_constraint(recv_weights, ep_sharding_2d)

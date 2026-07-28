@@ -18,7 +18,8 @@ Verifies that:
   * Without use_te_ep: ep_resource is None; dp_resource="data".
   * With use_te_ep=True: ep_resource="expert"; tp/dp/cp stay unset in the
     outer context so eval_shape does not validate resources before a mesh exists.
-  * With TE EP ETP1: tensor is expert-DP, not expert-TP.
+  * With TE EP ETP1: the outer context remains dense-compatible; EP's
+    expert-DP view is local to EP operations.
 """
 
 from types import SimpleNamespace
@@ -58,7 +59,7 @@ class TransformerEngineContextTest(unittest.TestCase):
     self.assertIsNone(resources["cp_resource"])
     self.assertIsNone(resources["dp_resource"])
 
-  def test_with_te_ep_etp1_maps_dense_tensor_to_expert_dp(self):
+  def test_with_te_ep_etp1_keeps_dense_compatible_outer_context(self):
     config = SimpleNamespace(
         use_te_ep=True,
         ici_tensor_parallelism=2,
@@ -66,9 +67,9 @@ class TransformerEngineContextTest(unittest.TestCase):
     )
     resources = max_utils._transformer_engine_mesh_resource_kwargs(config)
     self.assertEqual(resources["ep_resource"], "expert")
-    self.assertEqual(resources["dp_resource"], "tensor")
+    self.assertIsNone(resources["dp_resource"])
     self.assertIsNone(resources["tp_resource"])
-    self.assertIsNone(resources["fsdp_resource"])
+    self.assertEqual(resources["fsdp_resource"], "fsdp")
     self.assertIsNone(resources["cp_resource"])
 
   def test_none_config_defaults_to_no_te_ep(self):

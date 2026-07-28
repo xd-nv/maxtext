@@ -1,0 +1,146 @@
+diff --git a/transformer_engine/jax/cpp_extensions/ep.py b/transformer_engine/jax/cpp_extensions/ep.py
+--- a/transformer_engine/jax/cpp_extensions/ep.py
++++ b/transformer_engine/jax/cpp_extensions/ep.py
+@@ -102,22 +102,23 @@ def ep_handle_mem_size(cfg: EpLayerConfig) -> int:
+ def _leading_axis_ok(spec):
+     """Validate an EP input spec; return ``(ok, ep_axis, outer_axes)``.
+ 
+-    Leading dim is ``ep`` or a tuple ending in ``ep`` (outer dp/fsdp axes
+-    first); all other dims must be replicated.
++    Leading dim is ``ep`` or a tuple containing ``ep`` plus any local
++    EP-group axes; all other dims must be replicated.  The local outer axes
++    are inferred from the operand instead of MeshResource.dp/fsdp_resource so
++    EP can use a different rank view from dense GEMMs in the same program.
+     """
+     gsr = global_mesh_resource()
+     ep_axis = gsr.ep_resource
+-    outer_axes = tuple(a for a in (gsr.dp_resource, gsr.fsdp_resource) if a is not None)
+     if len(spec) < 2 or ep_axis is None:
+-        return False, ep_axis, outer_axes
++        return False, ep_axis, ()
+     if any(ax is not None for ax in spec[1:]):
+-        return False, ep_axis, outer_axes
++        return False, ep_axis, ()
+     leading = spec[0]
+     elts = leading if isinstance(leading, tuple) else (leading,)
+     if ep_axis not in elts:
+-        return False, ep_axis, outer_axes
+-    allowed = set(outer_axes) | {ep_axis}
+-    return all(a in allowed for a in elts), ep_axis, outer_axes
++        return False, ep_axis, ()
++    outer_axes = tuple(a for a in elts if a is not None and a != ep_axis)
++    return True, ep_axis, outer_axes
+ 
+ 
+ def _ep_outer_axis():
+@@ -150,22 +151,22 @@ def _ep_output_spec(*trailing):
+ 
+ 
+ def _ep_spec_ok(spec, trailing_count):
+-    """Leading dim shards along ep (and outer dp/fsdp when set); trailing dims
+-    are replicated. JAX may collapse size-1 mesh axes to ``None`` or drop them,
+-    so the leading entry is normalized to a set of named axes before comparing.
++    """Leading dim includes EP and may include call-local outer axes.
++
++    Trailing dimensions must be replicated.  We deliberately do not compare
++    the outer axes with the global MeshResource: dense TP and expert-DP can
++    assign different meanings to the same physical mesh axis.
+     """
+     gsr = global_mesh_resource()
+     ep_axis = gsr.ep_resource
+-    outer = _ep_outer_axis()
+-    if len(spec) != 1 + trailing_count:
++    if ep_axis is None or len(spec) != 1 + trailing_count:
+         return False
+     if any(ax is not None for ax in spec[1:]):
+         return False
+     leading = spec[0]
+     elts = leading if isinstance(leading, tuple) else (leading,)
+     actual = frozenset(a for a in elts if a is not None)
+-    expected = {ep_axis} if outer is None else {ep_axis, outer}
+-    return actual <= expected
++    return ep_axis in actual
+ 
+ 
+ # ── ep_prepare ──────────────────────────────────────────────────────────────
+@@ -864,8 +865,16 @@ class EpCombineBwdPrimitive(BasePrimitive):
+     ):
+         del is_outer, result_infos
+         arg_shardings = tuple(a.sharding for a in arg_infos)
+-        # EP-output leading (trailing dims auto-pad to None).
+-        out_sharding = NamedSharding(mesh, _ep_output_spec())
++        # The combine cotangent carries the source-token leading sharding.
++        # Reuse it for the EP-output leading dimension instead of consulting
++        # global dp/fsdp roles, which belong to dense GEMMs.
++        grad_spec = arg_infos[1].sharding.spec
++        if len(grad_spec) < 2 or grad_spec[0] is None:
++            raise NotImplementedError(
++                "EpCombineBwd: grad leading dimension must carry the EP input"
++                f" sharding; got spec={grad_spec}."
++            )
++        out_sharding = NamedSharding(mesh, PartitionSpec(grad_spec[0]))
+ 
+         def sharded_impl(handle_mem, grad):
+             return EpCombineBwdPrimitive.impl(
+diff --git a/transformer_engine/jax/ep.py b/transformer_engine/jax/ep.py
+--- a/transformer_engine/jax/ep.py
++++ b/transformer_engine/jax/ep.py
+@@ -207,8 +207,15 @@ def _default_out_partition_spec():
+ # ── ep_dispatch (custom_vjp) ─────────────────────────────────────────────────
+ 
+ 
+-@partial(jax.custom_vjp, nondiff_argnums=(0, 4))
+-def ep_dispatch(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
++@partial(jax.custom_vjp, nondiff_argnums=(0, 4, 5))
++def ep_dispatch(
++    cfg,
++    topk_idx,
++    tokens,
++    topk_weights,
++    recv_capacity_per_rank,
++    out_sharding=None,
++):
+     """Scatter tokens and weights to expert ranks.
+ 
+     ``cfg`` is a per-layer ``EpLayerConfig``; distinct layers may share a
+@@ -218,10 +225,24 @@ def ep_dispatch(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
+     ``(recv_tokens, recv_topk_weights, handle_mem, token_counts)``; pass
+     ``handle_mem`` and ``token_counts`` to the matching ``ep_combine``.
+     """
+-    return _dispatch_fwd(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank)[0]
++    return _dispatch_fwd(
++        cfg,
++        topk_idx,
++        tokens,
++        topk_weights,
++        recv_capacity_per_rank,
++        out_sharding,
++    )[0]
+ 
+ 
+-def _dispatch_fwd(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
++def _dispatch_fwd(
++    cfg,
++    topk_idx,
++    tokens,
++    topk_weights,
++    recv_capacity_per_rank,
++    out_sharding=None,
++):
+     if not jnp.issubdtype(topk_weights.dtype, jnp.floating):
+         raise TypeError(
+             f"ep_dispatch: topk_weights must be a floating dtype; got {topk_weights.dtype}."
+@@ -235,11 +256,11 @@ def _dispatch_fwd(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
+     return primal, (handle_mem, out_leading)
+ 
+ 
+-def _dispatch_bwd(cfg, recv_capacity_per_rank, res, g_outputs):
++def _dispatch_bwd(cfg, recv_capacity_per_rank, out_sharding, res, g_outputs):
+     del recv_capacity_per_rank
+     handle_mem, out_leading = res
+     # Re-pin cotangent: XLA transpose can drop the EP axis and feed the FFI a global tensor.
+-    out_spec = _default_out_partition_spec()
++    out_spec = _default_out_partition_spec() if out_sharding is None else out_sharding
+     spec = jax.sharding.PartitionSpec(*out_spec)
+     g_recv_tokens = with_sharding_constraint(g_outputs[0], spec)
+     g_recv_topk_weights = with_sharding_constraint(g_outputs[1], spec)

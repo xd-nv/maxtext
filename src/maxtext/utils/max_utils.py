@@ -1119,11 +1119,10 @@ def dummy_context_manager():
 def _transformer_engine_mesh_resource_kwargs(config=None) -> dict[str, str | None]:
   """Build TE mesh-resource roles without importing Transformer Engine."""
   use_te_ep = getattr(config, "use_te_ep", False)
-  use_te_ep_etp1 = use_te_ep and int(getattr(config, "te_ep_expert_tensor_parallelism", 0)) == 1
   return {
-      "dp_resource": "tensor" if use_te_ep_etp1 else None if use_te_ep else "data",
+      "dp_resource": None if use_te_ep else "data",
       "tp_resource": None if use_te_ep else "tensor",
-      "fsdp_resource": None if use_te_ep_etp1 else "fsdp",
+      "fsdp_resource": "fsdp",
       "pp_resource": None,
       "cp_resource": None if use_te_ep else "context",
       "ep_resource": "expert" if use_te_ep else None,
@@ -1137,9 +1136,9 @@ def transformer_engine_context(config=None):
 
   When ``config.use_te_ep`` is true, ``ep_resource="expert"`` is added so
   TE NCCL EP's custom_partitioning can resolve the EP axis at lowering time.
-  Legacy expert TP uses ``fsdp_resource`` as EP's outer companion. Megatron-
-  style ETP1 instead maps the dense ``tensor`` axis to ``dp_resource`` so the
-  same physical mesh is viewed as expert-DP × EP during TE lowering.
+  The outer context deliberately keeps the dense-compatible resource mapping.
+  TE EP operations derive their call-local outer axis from operand sharding;
+  globally mapping dense ``tensor`` to expert-DP would break TE dense GEMMs.
   """
   try:
     from transformer_engine.jax.sharding import global_shard_guard, MeshResource  # pylint: disable=import-outside-toplevel
