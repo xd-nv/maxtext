@@ -757,6 +757,13 @@ class MoEGeneral(BaseModel):
       1.0,
       description="Multiplier on TE EP worst-case recv_capacity_per_rank. 1.0 = exact worst case; >1.0 adds skew margin.",
   )
+  te_ep_drop_on_overflow: bool = Field(
+      False,
+      description=(
+          "PR3277 policy: drop TE EP receive slots beyond recv_capacity_per_rank "
+          "instead of trapping. total_recv_tokens still reports pre-drop demand."
+      ),
+  )
   te_ep_max_num_sms: int = Field(
       0,
       description="Optional SM cap passed to TE EP bootstrap; 0 lets TE choose.",

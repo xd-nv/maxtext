@@ -164,6 +164,16 @@ class ConfigTest(unittest.TestCase):
     self.assertEqual(config.ici_expert_parallelism, 4)
     self.assertEqual(config.dcn_expert_parallelism, 1)
     self.assertEqual(config.te_ep_recv_capacity_factor, 1.0)
+    self.assertFalse(config.te_ep_drop_on_overflow)
+
+  @patch("jax.devices")
+  def test_te_ep_accepts_drop_on_overflow(self, mock_devices):
+    """PR3277 overflow policy is explicitly configurable."""
+    mock_devices.return_value = [MagicMock(slice_index=0) for _ in range(4)]
+    config = pyconfig.initialize(
+        self._te_ep_argv("use_te_ep=true", "te_ep_drop_on_overflow=true")
+    )
+    self.assertTrue(config.te_ep_drop_on_overflow)
 
   @patch("jax.devices")
   def test_te_ep_rejects_multiple_ep_backends(self, mock_devices):

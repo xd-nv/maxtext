@@ -2104,7 +2104,7 @@ class RoutedMoE(nnx.Module):
           top_k=self.num_experts_per_tok,
           dispatch_output_per_expert_alignment=int(state.dispatch_alignment),
       )
-      recv_tokens, recv_weights, handle, token_counts = ep_dispatch(
+      recv_tokens, recv_weights, handle, token_counts, total_recv_tokens = ep_dispatch(
           ep_cfg,
           top_k_indices_2d,
           x_2d,
@@ -2114,6 +2114,11 @@ class RoutedMoE(nnx.Module):
       recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, ep_sharding_3d)
       recv_weights = jax.lax.with_sharding_constraint(recv_weights, ep_sharding_2d)
       token_counts = jax.lax.with_sharding_constraint(token_counts, ep_sharding_2d)
+      total_recv_tokens = jax.lax.with_sharding_constraint(total_recv_tokens, ep_sharding_2d)
+      # PR3277 reports each rank's padded pre-drop receive demand. Preserve the
+      # existing MoE return contract and expose the telemetry as an NNX
+      # intermediate for train-step aggregation.
+      self.sow(nnx.Intermediate, "te_ep_total_recv_tokens", total_recv_tokens)
 
       @functools.partial(
           jax.shard_map,

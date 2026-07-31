@@ -68,6 +68,7 @@ class TeEpState:
   num_local_experts: int
   max_tokens_per_rank: int
   recv_capacity_per_rank: int
+  drop_on_overflow: bool
   dispatch_alignment: int
   hidden_dim: int
   max_num_sms: int
@@ -340,6 +341,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       num_local_experts,
       max_tokens_per_rank,
       recv_capacity_per_rank,
+      bool(config.te_ep_drop_on_overflow),
       dispatch_alignment,
       _hidden_dim(config),
       int(config.te_ep_max_num_sms),
@@ -359,6 +361,7 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       num_local_experts=num_local_experts,
       max_tokens_per_rank=max_tokens_per_rank,
       recv_capacity_per_rank=recv_capacity_per_rank,
+      drop_on_overflow=bool(config.te_ep_drop_on_overflow),
       dispatch_alignment=dispatch_alignment,
       hidden_dim=_hidden_dim(config),
       max_num_sms=int(config.te_ep_max_num_sms),
@@ -438,6 +441,7 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
         recv_capacity_per_rank=candidate.recv_capacity_per_rank,
         hidden_dim=candidate.hidden_dim,
         max_num_sms=candidate.max_num_sms,
+        drop_on_overflow=candidate.drop_on_overflow,
     )
 
   _TE_EP_STATE = candidate
@@ -448,6 +452,7 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       f"num_moe_layers={candidate.num_moe_layers}, "
       f"max_tokens_per_rank={candidate.max_tokens_per_rank}, "
       f"recv_capacity_per_rank={candidate.recv_capacity_per_rank}, "
+      f"drop_on_overflow={candidate.drop_on_overflow}, "
       f"dispatch_alignment={candidate.dispatch_alignment}"
   )
   return _TE_EP_STATE
