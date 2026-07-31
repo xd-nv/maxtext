@@ -444,6 +444,24 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "learning/mtp_loss": mtp_loss,
       "learning/total_weights": total_weights,
   }
+  if config.use_te_ep:
+    # Import lazily so non-TE runs do not depend on Transformer Engine.
+    from maxtext.layers import te_ep_init  # pylint: disable=import-outside-toplevel
+
+    te_ep_recv_metrics = maxtext_utils.calculate_te_ep_recv_metrics(
+        intermediate_outputs,
+        te_ep_init.get_te_ep_state().recv_capacity_per_rank,
+    )
+    if te_ep_recv_metrics is not None:
+      scalar_metrics.update(
+          {
+              "learning/te_ep_recv_demand_max": te_ep_recv_metrics["recv_demand_max"],
+              "learning/te_ep_recv_demand_p999": te_ep_recv_metrics["recv_demand_p999"],
+              "learning/te_ep_recv_capacity": te_ep_recv_metrics["recv_capacity"],
+              "learning/te_ep_overflow_slots": te_ep_recv_metrics["overflow_slots"],
+              "learning/te_ep_overflow_ratio": te_ep_recv_metrics["overflow_ratio"],
+          }
+      )
   if config.use_qk_clip:
     # Apply QK-Clip
     new_state = qk_clip_utils.apply_qk_clip(new_state, intermediate_outputs, config)

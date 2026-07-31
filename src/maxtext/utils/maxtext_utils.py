@@ -1094,6 +1094,35 @@ def collect_intermediates_by_suffix(intermediate_outputs, *suffix_keys: str) -> 
   return values
 
 
+def calculate_te_ep_recv_metrics(intermediate_outputs, recv_capacity_per_rank: int) -> dict[str, jax.Array] | None:
+  """Aggregate PR3277 pre-drop receive demand across layers and ranks.
+
+  ``total_recv_tokens`` already includes TE EP's per-expert alignment padding,
+  so it can be compared directly with ``recv_capacity_per_rank``.
+  """
+  demands = collect_intermediates_by_suffix(
+      intermediate_outputs, "te_ep_total_recv_tokens"
+  )
+  if not demands:
+    return None
+
+  all_demands = jnp.concatenate(demands).astype(jnp.int32)
+  capacity = jnp.asarray(recv_capacity_per_rank, dtype=jnp.int32)
+  overflow = jnp.maximum(all_demands - capacity, 0)
+  total_demand = jnp.sum(all_demands)
+  overflow_slots = jnp.sum(overflow)
+  return {
+      "recv_demand_max": jnp.max(all_demands),
+      "recv_demand_p999": jnp.quantile(
+          all_demands.astype(jnp.float32), 0.999, method="higher"
+      ),
+      "recv_capacity": capacity,
+      "overflow_slots": overflow_slots,
+      "overflow_ratio": overflow_slots.astype(jnp.float32)
+      / jnp.maximum(total_demand, 1).astype(jnp.float32),
+  }
+
+
 def get_intermediate_value(model, nested_key, default=None, clear=False):
   """
   Retrieves an intermediate value from an NNX model. This functions has context about

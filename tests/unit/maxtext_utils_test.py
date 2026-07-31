@@ -45,6 +45,38 @@ import optax
 Transformer = models.transformer_as_linen
 
 
+class TestTeEpRecvMetrics(unittest.TestCase):
+  """Tests PR3277 receive-demand aggregation."""
+
+  def test_aggregates_layers_and_overflow(self):
+    intermediate_outputs = {
+        "intermediates": {
+            "decoder": {
+                "layer_0": {"te_ep_total_recv_tokens": (jnp.array([80, 120]),)},
+                "layer_1": {"te_ep_total_recv_tokens": (jnp.array([130, 90]),)},
+            }
+        }
+    }
+
+    metrics = maxtext_utils.calculate_te_ep_recv_metrics(
+        intermediate_outputs, recv_capacity_per_rank=100
+    )
+
+    self.assertIsNotNone(metrics)
+    self.assertEqual(int(metrics["recv_demand_max"]), 130)
+    self.assertEqual(float(metrics["recv_demand_p999"]), 130.0)
+    self.assertEqual(int(metrics["recv_capacity"]), 100)
+    self.assertEqual(int(metrics["overflow_slots"]), 50)
+    self.assertAlmostEqual(float(metrics["overflow_ratio"]), 50 / 420)
+
+  def test_returns_none_without_te_ep_intermediate(self):
+    self.assertIsNone(
+        maxtext_utils.calculate_te_ep_recv_metrics(
+            {"intermediates": {}}, recv_capacity_per_rank=128
+        )
+    )
+
+
 class TestGradientClipping(unittest.TestCase):
   """test class for gradient clipping"""
 
