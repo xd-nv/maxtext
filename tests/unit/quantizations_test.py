@@ -169,14 +169,18 @@ class QuantizationTest(unittest.TestCase):
     self.assertIsNone(leading_shape)
 
   def test_etp1_te_patch_keeps_single_contracting_dimension_parser(self):
-    patch_path = Path(__file__).parents[2] / "src/maxtext/te_ep_mixed_rank_views.patch"
+    maxtext_root = Path(__file__).parents[2]
+    patch_path = maxtext_root / "src/maxtext/te_ep_mixed_rank_views.patch"
+    overlay_ep_path = maxtext_root / "src/maxtext/te_overlay/transformer_engine/jax/ep.py"
     patch_text = patch_path.read_text(encoding="utf-8")
+    overlay_ep_text = overlay_ep_path.read_text(encoding="utf-8")
 
     self.assertNotIn("reduce_specs = []", patch_text)
     self.assertNotIn("def is_reduce_spec", patch_text)
-    self.assertIn("def _ep_domain_for_rank", patch_text)
-    self.assertIn("all_uids[root_rank]", patch_text)
-    self.assertIn("with jax.set_mesh(mesh):", patch_text)
+    self.assertIn("def _ep_domain_for_rank", overlay_ep_text)
+    self.assertIn("all_uids[root_rank]", overlay_ep_text)
+    self.assertIn("with jax.set_mesh(mesh):", overlay_ep_text)
+    self.assertIn("def _num_ep_output_groups", overlay_ep_text)
     self.assertIn("reduce_axes = reduce_spec if isinstance(reduce_spec, tuple)", patch_text)
     self.assertIn("for axis in reduce_axes:", patch_text)
 

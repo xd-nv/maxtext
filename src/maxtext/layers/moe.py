@@ -1398,7 +1398,8 @@ class RoutedMoE(nnx.Module):
     """Selects bias values for a variable number of bias tensors based on chosen experts."""
     return tuple(bias[experts_index] for bias in biases)
 
-  def get_ragged_buffer_size(self, local_batch, ep_degree, global_experts, top_k, ragged_buffer_factor):
+  @staticmethod
+  def get_ragged_buffer_size(local_batch, ep_degree, global_experts, top_k, ragged_buffer_factor):
     """Calculates the token batch size of the ragged buffer.
     When explicitly setting ragged_buffer_factor>0, this is balanced_size * ragged_buffer_factor, which can drop tokens.
     Otherwise this will be worst case size to ensure no dropping.
