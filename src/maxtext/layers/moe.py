@@ -141,6 +141,31 @@ def _sort_activations_custom_bwd(residuals: jax.Array, grads: jax.Array) -> tupl
 _sort_activations_custom.defvjp(_sort_activations_custom_fwd, _sort_activations_custom_bwd)
 
 
+def _te_ep_valid_recv_slots(recv_weights, token_counts, recv_capacity, alignment):
+  """Return real TE EP receive slots for actual or padded token counts.
+
+  ``token_counts`` has varied across TE APIs: some versions return actual
+  per-expert counts, while PR3036 returns aligned/padded counts. Rounding is
+  idempotent for the latter and establishes the end of the packed expert
+  blocks for both forms. Routing weights then distinguish real routes from
+  intra-block padding. The structural bound remains necessary because TE may
+  leave finite nonzero garbage in the overallocated tail.
+
+  Real top-k routing weights are finite and strictly positive. DeepSeek may
+  scale them above one, so there is intentionally no upper-bound check.
+  Underflowed zero weights contribute nothing and are safely treated as
+  padding.
+  """
+  counts = jnp.asarray(token_counts).reshape(-1)
+  weights = jnp.asarray(recv_weights).reshape(-1)
+  align = jnp.asarray(alignment, dtype=counts.dtype)
+  padded_counts = ((counts + align - 1) // align) * align
+  positions = jnp.arange(recv_capacity, dtype=counts.dtype)
+  in_packed_blocks = positions < jnp.minimum(padded_counts.sum(), recv_capacity)
+  has_valid_weight = jnp.isfinite(weights) & (weights > 0)
+  return in_packed_blocks & has_valid_weight
+
+
 def get_batchsplit_init_kernel_axes():
   return (
       ("embed_moe", None, "expert_only"),
@@ -2217,7 +2242,8 @@ class RoutedMoE(nnx.Module):
       )
       def te_ep_expert_compute(recv_t, recv_w, tc, w0, w1, wo, w0_bias, w1_bias, wo_bias):
         # Per-shard shapes: recv_t [1, recv_capacity, H], recv_w [1, recv_capacity],
-        # tc [1, NLE] actual token counts per local expert (un-padded).
+        # tc [1, NLE] per-local-expert counts. Depending on the TE API version,
+        # these counts may be actual or already padded to dispatch_alignment.
         recv_t_local_shape = recv_t.shape
         recv_t = recv_t.reshape(state.recv_capacity_per_rank, -1)
         recv_w = recv_w.reshape(state.recv_capacity_per_rank)
@@ -2225,11 +2251,11 @@ class RoutedMoE(nnx.Module):
 
         align = jnp.int32(state.dispatch_alignment)
         padded = ((tc + align - 1) // align) * align
-        starts = jnp.cumsum(padded) - padded
-        pos = jnp.arange(state.recv_capacity_per_rank, dtype=jnp.int32)
-        valid_slot = jnp.any(
-            (pos[:, None] >= starts[None, :]) & (pos[:, None] < (starts + tc)[None, :]),
-            axis=1,
+        valid_slot = _te_ep_valid_recv_slots(
+            recv_w,
+            tc,
+            state.recv_capacity_per_rank,
+            state.dispatch_alignment,
         )
 
         # Zero padded recv-buffer slots before the GMM. This is a NaN guard, not a
@@ -2242,18 +2268,16 @@ class RoutedMoE(nnx.Module):
         # from commit 2924120f (later dropped only to test the B300 V2 path); it must
         # NOT be gated on needs_v1_tail_absorb, which is the orthogonal mxfp8/sm_90
         # tail-absorption flag and is False for bf16.
-        # Use structural token-count mask, not recv_w, to identify real slots.
-        # recv_w can contain nonzero garbage in overallocated tail slots.
+        # The mask combines the packed-block structural bound (excluding finite
+        # garbage in the overallocated tail) with finite positive routing weights
+        # (excluding intra-expert padding even when tc is already padded).
         safe_recv_w = jnp.where(valid_slot, recv_w, 0.0)
         recv_t = jnp.where(valid_slot[:, None], recv_t, 0.0)
 
 
-        # Per-expert padded counts: TE EP lays each expert's block back-to-back in the
-        # recv buffer, each block sized `ceil(tc[k] / dispatch_alignment) * dispatch_alignment`
-        # rows (mirrors HybridEP's `pad_multiple` layout). The GMM consumer uses these
-        # padded counts as `group_sizes` so per-expert reads land at the right offsets.
-        # Padded/overallocated slots cannot be identified by recv_w: TE EP may leave
-        # nonzero garbage there, so valid_slot must come from token_counts.
+        # TE EP lays each padded expert block back-to-back in the recv buffer.
+        # Rounding is idempotent when tc is already padded; keep these padded
+        # group_sizes unchanged so per-expert GMM reads retain the API layout.
         if state.needs_v1_tail_absorb:
           # sm_90: TE's V1 GroupedQuantizeFFI fallback for MXFP8 asserts
           # `sum(group_sizes) == m || sum == input_dims[0]`. Absorb the unused tail
@@ -2350,9 +2374,9 @@ class RoutedMoE(nnx.Module):
         intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
 
         # pr-3036 ep_combine is UNWEIGHTED: the caller must pre-multiply by the
-        # per-slot routing weight. safe_recv_w is zero outside structural valid slots;
-        # hard-select zeros before/after multiplying so invalid tail values cannot
-        # produce Inf*0=NaN or leak into ep_combine/backward.
+        # per-slot routing weight. Hard-select zeros before and after multiplying
+        # so neither intra-block padding nor tail garbage can retain Inf*0 paths
+        # in the backward pass.
         intermediate_output = jnp.where(valid_slot[:, None], intermediate_output, 0.0)
         intermediate_output = intermediate_output * safe_recv_w[:, None]
         intermediate_output = jnp.where(valid_slot[:, None], intermediate_output, 0.0)

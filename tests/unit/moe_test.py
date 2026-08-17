@@ -92,6 +92,46 @@ class TeEpEtp1KernelAxesTest(unittest.TestCase):
     )
 
 
+class TeEpRecvSlotMaskTest(unittest.TestCase):
+
+  def test_padded_counts_exclude_zero_weight_intra_block_padding(self):
+    weights = jnp.array([0.8, 0.7, 0.0, 0.0, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0])
+    valid = moe._te_ep_valid_recv_slots(weights, jnp.array([4, 4]), 10, 4)
+    self.assertEqual(
+        valid.tolist(),
+        [True, True, False, False, True, False, False, False, False, False],
+    )
+
+  def test_actual_counts_use_same_padded_block_layout(self):
+    weights = jnp.array([0.8, 0.7, 0.0, 0.0, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0])
+    valid = moe._te_ep_valid_recv_slots(weights, jnp.array([2, 1]), 10, 4)
+    self.assertEqual(
+        valid.tolist(),
+        [True, True, False, False, True, False, False, False, False, False],
+    )
+
+  def test_finite_nonzero_tail_garbage_is_structurally_excluded(self):
+    weights = jnp.array([0.8, 0.0, 0.0, 0.0, 0.6, 0.0, 0.0, 0.0, 0.4, 0.3])
+    valid = moe._te_ep_valid_recv_slots(weights, jnp.array([4, 4]), 10, 4)
+    self.assertEqual(
+        valid.tolist(),
+        [True, False, False, False, True, False, False, False, False, False],
+    )
+
+  def test_nonfinite_weights_are_excluded(self):
+    weights = jnp.array([0.8, jnp.nan, jnp.inf, -jnp.inf, 0.6, 0.0, 0.0, 0.0])
+    valid = moe._te_ep_valid_recv_slots(weights, jnp.array([4, 4]), 8, 4)
+    self.assertEqual(
+        valid.tolist(),
+        [True, False, False, False, True, False, False, False],
+    )
+
+  def test_all_finite_positive_real_weights_are_retained_without_upper_bound(self):
+    weights = jnp.array([0.8, 1.25, 1.0e-30, 0.0])
+    valid = moe._te_ep_valid_recv_slots(weights, jnp.array([4]), 4, 4)
+    self.assertEqual(valid.tolist(), [True, True, True, False])
+
+
 class TokenDroppingTest(unittest.TestCase):
 
   def setUp(self):
