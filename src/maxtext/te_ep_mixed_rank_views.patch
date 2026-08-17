@@ -1,16 +1,17 @@
 diff --git a/transformer_engine/jax/cpp_extensions/ep.py b/transformer_engine/jax/cpp_extensions/ep.py
+index ca70ea14..5d03459a 100644
 --- a/transformer_engine/jax/cpp_extensions/ep.py
 +++ b/transformer_engine/jax/cpp_extensions/ep.py
-@@ -102,22 +102,23 @@ def ep_handle_mem_size(cfg: EpLayerConfig) -> int:
+@@ -135,22 +135,23 @@ def ep_handle_mem_size(cfg: EpLayerConfig) -> int:
  def _leading_axis_ok(spec):
      """Validate an EP input spec; return ``(ok, ep_axis, outer_axes)``.
  
 -    Leading dim is ``ep`` or a tuple ending in ``ep`` (outer dp/fsdp axes
 -    first); all other dims must be replicated.
-+    Leading dim is ``ep`` or a tuple containing ``ep`` plus any local
-+    EP-group axes; all other dims must be replicated.  The local outer axes
-+    are inferred from the operand instead of MeshResource.dp/fsdp_resource so
-+    EP can use a different rank view from dense GEMMs in the same program.
++    Leading dim is ``ep`` or a tuple containing ``ep`` plus any operand-local
++    outer axes; all other dims must be replicated. Outer axes are inferred from
++    the operand instead of global dp/fsdp resources so EP can use a compound
++    rank view that differs from dense GEMMs in the same program.
      """
      gsr = global_mesh_resource()
      ep_axis = gsr.ep_resource
@@ -33,18 +34,17 @@ diff --git a/transformer_engine/jax/cpp_extensions/ep.py b/transformer_engine/ja
  
  
  def _ep_outer_axis():
-@@ -150,22 +151,22 @@ def _ep_output_spec(*trailing):
+@@ -190,22 +191,21 @@ def _ep_output_spec(*trailing):
  
  
  def _ep_spec_ok(spec, trailing_count):
 -    """Leading dim shards along ep (and outer dp/fsdp when set); trailing dims
 -    are replicated. JAX may collapse size-1 mesh axes to ``None`` or drop them,
 -    so the leading entry is normalized to a set of named axes before comparing.
-+    """Leading dim includes EP and may include call-local outer axes.
++    """Validate an EP output spec with operand-local outer axes.
 +
-+    Trailing dimensions must be replicated.  We deliberately do not compare
-+    the outer axes with the global MeshResource: dense TP and expert-DP can
-+    assign different meanings to the same physical mesh axis.
++    The leading dimension must contain EP and may contain arbitrary outer axes;
++    every trailing dimension must remain replicated.
      """
      gsr = global_mesh_resource()
      ep_axis = gsr.ep_resource
@@ -63,15 +63,14 @@ diff --git a/transformer_engine/jax/cpp_extensions/ep.py b/transformer_engine/ja
  
  
  # ── ep_prepare ──────────────────────────────────────────────────────────────
-@@ -864,8 +865,16 @@ class EpCombineBwdPrimitive(BasePrimitive):
+@@ -901,8 +901,15 @@ class EpCombineBwdPrimitive(BasePrimitive):
      ):
          del is_outer, result_infos
          arg_shardings = tuple(a.sharding for a in arg_infos)
 -        # EP-output leading (trailing dims auto-pad to None).
 -        out_sharding = NamedSharding(mesh, _ep_output_spec())
 +        # The combine cotangent carries the source-token leading sharding.
-+        # Reuse it for the EP-output leading dimension instead of consulting
-+        # global dp/fsdp roles, which belong to dense GEMMs.
++        # Preserve it instead of consulting the single global dp/fsdp role.
 +        grad_spec = arg_infos[1].sharding.spec
 +        if len(grad_spec) < 2 or grad_spec[0] is None:
 +            raise NotImplementedError(
@@ -82,127 +81,99 @@ diff --git a/transformer_engine/jax/cpp_extensions/ep.py b/transformer_engine/ja
  
          def sharded_impl(handle_mem, grad):
              return EpCombineBwdPrimitive.impl(
+diff --git a/transformer_engine/jax/cpp_extensions/gemm.py b/transformer_engine/jax/cpp_extensions/gemm.py
+index f56f03e4..428967b5 100644
+--- a/transformer_engine/jax/cpp_extensions/gemm.py
++++ b/transformer_engine/jax/cpp_extensions/gemm.py
+@@ -1173,12 +1173,15 @@ class GemmPrimitive(BasePrimitive):
+ 
+             if reduce_spec is not None:
+                 if not collective_op.is_reduce_scatter:
++                    reduce_axes = reduce_spec if isinstance(reduce_spec, tuple) else (reduce_spec,)
+                     if is_all_reduce_in_float32():  # For unittest only
+-                        output = jax.lax.psum(output.astype(jnp.float32), reduce_spec).astype(
+-                            out_dtype
+-                        )
++                        output = output.astype(jnp.float32)
++                        for axis in reduce_axes:
++                            output = jax.lax.psum(output, axis)
++                        output = output.astype(out_dtype)
+                     else:
+-                        output = jax.lax.psum(output, reduce_spec)
++                        for axis in reduce_axes:
++                            output = jax.lax.psum(output, axis)
+ 
+                 if has_bias:
+                     output += bias
 diff --git a/transformer_engine/jax/ep.py b/transformer_engine/jax/ep.py
+index 32074b49..88ee50a3 100644
 --- a/transformer_engine/jax/ep.py
 +++ b/transformer_engine/jax/ep.py
-@@ -17,6 +17,8 @@ import transformer_engine.jax.cpp_extensions as tex
- from transformer_engine.jax.cpp_extensions.ep import _ep_outer_axis
- from transformer_engine.jax.cpp_extensions.misc import jax_dtype_to_te_dtype
- from transformer_engine.jax.sharding import (
-+    _get_mesh,
-+    get_num_devices_in_mesh,
-     global_mesh_resource,
-     get_mesh_axis_size,
-     with_sharding_constraint,
-@@ -65 +65,2 @@ def _allgather_uid(uid_arr, world_size, uid_size):
+@@ -65,7 +65,8 @@ def _allgather_uid(uid_arr, world_size, uid_size):
+     replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+     local = np.asarray(uid_arr).reshape(1, uid_size)
+     g_in = jax.make_array_from_process_local_data(sharded, local, (world_size, uid_size))
 -    g_out = jax.jit(lambda x: x, out_shardings=replicated)(g_in)
 +    with jax.set_mesh(mesh):
 +        g_out = jax.jit(lambda x: x, out_shardings=replicated)(g_in)
-@@ -69,6 +70,34 @@ def _allgather_uid(uid_arr, world_size, uid_size):
- # ── Bootstrap ────────────────────────────────────────────────────────────────
+     return np.asarray(g_out).reshape(world_size, uid_size)
  
  
-+def _ep_domain_for_rank(mesh, ep_resource, rank, device_to_rank=None):
-+    """Resolve the EP domain (NCCL comm) for ``rank`` from the mesh layout.
-+
-+    One domain groups ranks sharing all non-ep coordinates, so any orthogonal
-+    axis (tp, pp, cp, ...) yields its own domains. Returns
-+    ``(root_rank, rank_within_group, num_domains)``; ``root_rank`` (ep
-+    coordinate 0) posts the domain's NCCL unique id.
-+    """
-+    if device_to_rank is None:
-+
-+        def device_to_rank(d):
-+            return d.process_index
-+
-+    ep_pos = mesh.axis_names.index(ep_resource)
-+    ep_size = mesh.shape[ep_resource]
-+    ranks = np.vectorize(device_to_rank, otypes=[np.int64])(mesh.devices)
-+    # Move ep last and flatten: each row is one domain (all non-ep coords fixed).
-+    grid = np.moveaxis(ranks, ep_pos, -1).reshape(-1, ep_size)
-+    loc = np.argwhere(grid == rank)
-+    if loc.shape[0] != 1:
-+        raise ValueError(
-+            f"ep_bootstrap: rank {rank} must appear exactly once in the mesh device"
-+            f" grid; found {loc.shape[0]} occurrences."
+@@ -100,6 +101,21 @@ def _ep_domain_for_rank(mesh, ep_resource, rank, device_to_rank=None):
+     return int(grid[row, 0]), col, int(grid.shape[0])
+ 
+ 
++def _num_ep_output_groups(mesh_resource, axis_size_fn=get_mesh_axis_size):
++    """Count distinct EP output slabs from DP/FSDP resources, excluding TP."""
++    distinct_token_axes = tuple(
++        dict.fromkeys(
++            axis
++            for axis in (mesh_resource.dp_resource, mesh_resource.fsdp_resource)
++            if axis is not None
 +        )
-+    row, col = int(loc[0, 0]), int(loc[0, 1])
-+    return int(grid[row, 0]), col, int(grid.shape[0])
++    )
++    num_groups = 1
++    for axis in distinct_token_axes:
++        num_groups *= int(axis_size_fn(axis))
++    return num_groups
 +
 +
  def ep_bootstrap(
      world_size,
      rank,
-@@ -83,10 +112,11 @@ def ep_bootstrap(
- 
-     Must run inside the active JAX Mesh and a global_shard_guard; ep_size and
-     num_ep_groups are read from the mesh axes named by MeshResource.ep_resource
--    and MeshResource.dp_resource/fsdp_resource.
-+    and MeshResource.dp_resource/fsdp_resource. Axes orthogonal to EP (tp, pp,
-+    cp, ...) are supported and replicated across EP tensors.
- 
-     Args:
--        world_size: Total number of processes (dp_size * ep_size).
-+        world_size: Total number of processes (product of all mesh axes).
-         rank: Global rank of the calling process.
-         num_experts: Total experts across the EP group.
-         max_tokens_per_rank: Max tokens one rank dispatches per step (sizes send buffers).
-@@ -120,30 +150,27 @@ def ep_bootstrap(
-             "ep_bootstrap requires MeshResource.ep_resource to be set; enter a"
-             " global_shard_guard(MeshResource(..., ep_resource=<axis name>)) before bootstrap."
+@@ -168,15 +184,26 @@ def ep_bootstrap(
+             f" world_size ({world_size})."
          )
--    ep_size = get_mesh_axis_size(ep_resource)
+     ep_size = get_mesh_axis_size(ep_resource)
+-    # num_ep_groups counts only the distinct-token (dp/fsdp) axes; replicated
+-    # axes (tp, pp, ...) do not create distinct EP-output slabs.
 -    outer_axis = _ep_outer_axis()
--    if outer_axis is None:
--        if world_size != ep_size:
--            raise ValueError(
--                f"ep_bootstrap: world_size ({world_size}) > ep_size ({ep_size}) but neither"
--                " MeshResource.dp_resource nor fsdp_resource is set; name the outer axis so"
--                " EP-output tensors can shard across EP groups."
--            )
--        num_ep_groups = 1
--    else:
--        num_ep_groups = get_mesh_axis_size(outer_axis)
--    if num_ep_groups * ep_size != world_size:
-+    mesh = _get_mesh()
-+    if mesh.empty:
+-    num_ep_groups = 1 if outer_axis is None else get_mesh_axis_size(outer_axis)
++    if world_size % ep_size != 0:
 +        raise ValueError(
-+            "ep_bootstrap must run inside an active jax.sharding.Mesh; enter"
-+            " `with mesh:` (or jax.set_mesh(mesh)) before calling it."
++            f"ep_bootstrap: world_size ({world_size}) must be divisible by ep_size ({ep_size})."
 +        )
-+    if get_num_devices_in_mesh(mesh) != world_size:
-         raise ValueError(
--            f"ep_bootstrap: num_ep_groups*ep_size ({num_ep_groups}*{ep_size}="
--            f"{num_ep_groups * ep_size}) must equal world_size ({world_size}); check that"
--            f" the '{outer_axis}' and '{ep_resource}' mesh axes cover all ranks."
-+            f"ep_bootstrap: mesh device count ({get_num_devices_in_mesh(mesh)}) must equal"
-+            f" world_size ({world_size})."
-         )
-+    ep_size = get_mesh_axis_size(ep_resource)
-+    # num_ep_groups counts only the distinct-token (dp/fsdp) axes; replicated
-+    # axes (tp, pp, ...) do not create distinct EP-output slabs.
-+    outer_axis = _ep_outer_axis()
-+    num_ep_groups = 1 if outer_axis is None else get_mesh_axis_size(outer_axis)
++    # Communicators cover every fixed non-EP coordinate, including TP replicas.
++    expected_num_domains = world_size // ep_size
++    # EP outputs only distinguish token-owning DP/FSDP coordinates. TP is a
++    # replicated communicator dimension unless deliberately named as DP, as in
++    # MaxText's compound ETP1 view (dp=tensor, fsdp=fsdp).
++    num_ep_groups = _num_ep_output_groups(gsr)
      if num_experts % ep_size != 0:
          raise ValueError(f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size}).")
  
      UID_SIZE = 128
--    dp_color = rank // ep_size
--    rank_within_group = rank % ep_size
-+    root_rank, rank_within_group, _num_domains = _ep_domain_for_rank(mesh, ep_resource, rank)
+-    root_rank, rank_within_group, _num_domains = _ep_domain_for_rank(mesh, ep_resource, rank)
++    root_rank, rank_within_group, num_domains = _ep_domain_for_rank(mesh, ep_resource, rank)
++    if num_domains != expected_num_domains:
++        raise ValueError(
++            f"ep_bootstrap: mesh has {num_domains} EP domains, expected"
++            f" world_size // ep_size = {expected_num_domains}."
++        )
      is_color_root = rank_within_group == 0
      if is_color_root:
          libnccl = ctypes.CDLL("libnccl.so.2", use_errno=True)
-@@ -156,7 +183,7 @@ def ep_bootstrap(
- 
-     uid_arr = jnp.frombuffer(uid_bytes, dtype=jnp.uint8)
-     all_uids = _allgather_uid(uid_arr, world_size, UID_SIZE)
--    uid_bytes = bytes(np.asarray(all_uids[dp_color * ep_size]).tolist())
-+    uid_bytes = bytes(np.asarray(all_uids[root_rank]).tolist())
- 
-     # Eager NCCL init while ranks are barrier-synced by the UID broadcast above.
-     transformer_engine_jax.set_ep_bootstrap_params(
-@@ -207,8 +236,15 @@ def _default_out_partition_spec():
+@@ -255,8 +282,15 @@ def _default_out_partition_spec():
  # ── ep_dispatch (custom_vjp) ─────────────────────────────────────────────────
  
  
@@ -220,9 +191,9 @@ diff --git a/transformer_engine/jax/ep.py b/transformer_engine/jax/ep.py
      """Scatter tokens and weights to expert ranks.
  
      ``cfg`` is a per-layer ``EpLayerConfig``; distinct layers may share a
-@@ -218,10 +254,24 @@ def ep_dispatch(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
-     ``(recv_tokens, recv_topk_weights, handle_mem, token_counts)``; pass
-     ``handle_mem`` and ``token_counts`` to the matching ``ep_combine``.
+@@ -272,10 +306,24 @@ def ep_dispatch(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
+     the worst case, detect overflow by ``process_allgather``-ing it, then
+     ``max(...) > recv_capacity_per_rank`` flags an overflowing step.
      """
 -    return _dispatch_fwd(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank)[0]
 +    return _dispatch_fwd(
@@ -247,7 +218,7 @@ diff --git a/transformer_engine/jax/ep.py b/transformer_engine/jax/ep.py
      if not jnp.issubdtype(topk_weights.dtype, jnp.floating):
          raise TypeError(
              f"ep_dispatch: topk_weights must be a floating dtype; got {topk_weights.dtype}."
-@@ -235,11 +285,11 @@ def _dispatch_fwd(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
+@@ -289,11 +337,11 @@ def _dispatch_fwd(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
      return primal, (handle_mem, out_leading)
  
  
@@ -261,25 +232,3 @@ diff --git a/transformer_engine/jax/ep.py b/transformer_engine/jax/ep.py
      spec = jax.sharding.PartitionSpec(*out_spec)
      g_recv_tokens = with_sharding_constraint(g_outputs[0], spec)
      g_recv_topk_weights = with_sharding_constraint(g_outputs[1], spec)
-diff --git a/transformer_engine/jax/cpp_extensions/gemm.py b/transformer_engine/jax/cpp_extensions/gemm.py
---- a/transformer_engine/jax/cpp_extensions/gemm.py
-+++ b/transformer_engine/jax/cpp_extensions/gemm.py
-@@ -1164,11 +1164,13 @@ class GemmPrimitive(BasePrimitive):
-             if reduce_spec is not None:
-                 if not collective_op.is_reduce_scatter:
-+                    reduce_axes = reduce_spec if isinstance(reduce_spec, tuple) else (reduce_spec,)
-                     if is_all_reduce_in_float32():  # For unittest only
--                        output = jax.lax.psum(output.astype(jnp.float32), reduce_spec).astype(
--                            out_dtype
--                        )
-+                        output = output.astype(jnp.float32)
-+                        for axis in reduce_axes:
-+                            output = jax.lax.psum(output, axis)
-+                        output = output.astype(out_dtype)
-                     else:
--                        output = jax.lax.psum(output, reduce_spec)
-+                        for axis in reduce_axes:
-+                            output = jax.lax.psum(output, axis)
--
-                 if has_bias:
-                     output += bias

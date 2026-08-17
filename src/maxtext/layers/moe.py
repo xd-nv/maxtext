@@ -148,6 +148,16 @@ def get_batchsplit_init_kernel_axes():
   )
 
 
+def get_te_ep_etp1_kernel_axes(mesh):
+  """Return ETP1 expert parameter axes, retaining complete experts for FSDP1."""
+  if int(mesh.shape.get("fsdp", 1)) > 1:
+    # Store expert parameters over EP and FSDP. The TE EP expert-compute
+    # shard_map consumes them with P("expert", None, None), inducing the FSDP
+    # all-gather before each GEMM while preserving ETP1 execution.
+    return ("exp", "embed_moe", None), ("exp", None, "embed_moe")
+  return ("exp", None, None), ("exp", None, None)
+
+
 def random_routing(rng_key, gate_logits, num_experts_per_tok):
   """Performs random routing of tokens to experts.
 
@@ -416,11 +426,10 @@ class RoutedMoE(nnx.Module):
     )
 
     if self.config.use_te_ep and self.config.te_ep_expert_tensor_parallelism == 1:
-      # ETP1 owns complete expert matrices on every expert rank.  The dense
-      # tensor axis is sequence parallelism / expert-DP at the MoE boundary,
-      # not an expert weight-sharding axis.
-      self.wi_kernel_axes = ("exp", None, None)
-      self.wo_kernel_axes = ("exp", None, None)
+      # Dense TP is sequence/expert-data parallelism at the MoE boundary, not
+      # an expert weight-sharding axis. Active FSDP still shards parameters at
+      # rest; the expert-compute shard_map gathers it before ETP1 GEMMs.
+      self.wi_kernel_axes, self.wo_kernel_axes = get_te_ep_etp1_kernel_axes(self.mesh)
     elif self.config.shard_exp_on_fsdp:
       # special sharding for dsv3
       self.wi_kernel_axes = ("embed_moe", None, "mlp_moe")

@@ -47,6 +47,21 @@ class GateQuantizationTest(unittest.TestCase):
     self.assertIs(moe._get_gate_quantization(config, te_quant), te_quant)
 
 
+class TeEpEtp1KernelAxesTest(unittest.TestCase):
+
+  def test_active_fsdp_shards_expert_parameters_at_rest(self):
+    mesh = SimpleNamespace(shape={"tensor": 2, "expert": 4, "fsdp": 4})
+    wi_axes, wo_axes = moe.get_te_ep_etp1_kernel_axes(mesh)
+    self.assertEqual(wi_axes, ("exp", "embed_moe", None))
+    self.assertEqual(wo_axes, ("exp", None, "embed_moe"))
+
+  def test_fsdp1_retains_complete_expert_parameters(self):
+    mesh = SimpleNamespace(shape={"tensor": 2, "expert": 16, "fsdp": 1})
+    wi_axes, wo_axes = moe.get_te_ep_etp1_kernel_axes(mesh)
+    self.assertEqual(wi_axes, ("exp", None, None))
+    self.assertEqual(wo_axes, ("exp", None, None))
+
+
 class TokenDroppingTest(unittest.TestCase):
 
   def setUp(self):

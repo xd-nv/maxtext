@@ -1,0 +1,8 @@
+TransformerEngine version: 2.19.0.dev0
+Baseline commit: 228c8c87
+Baseline branch: xiaopo/te-f07-pr3083-compound
+
+Path                                                     Baseline SHA256                                                   Overlay SHA256
+transformer_engine/jax/ep.py                             8754bbd0b3a97b134d4391e929fab5dcd38f1cba6d1ccc1062c6e45204b7883c  6b2547ce4d946549991852ac7a2ab1d985d7085355110aa1ece59eaed038ccc2
+transformer_engine/jax/cpp_extensions/ep.py              bfe7d6334fb510ad137951629fcf7b15d842bfbbf5acbfa58d8cc6f638cd6077  46c0ae611d12cc3b2541f09c33a4b0f3eb846071620548ed8a0316bc42833f25
+transformer_engine/jax/cpp_extensions/gemm.py            91dd77dc1e2713e0d53f44d200be5eefa29259218fc15dbab6b887981a624deb  ff5aaf72762ec1c7b0918d4e1d9dc86014c894d23f6e418fd0b4968b07b2de21

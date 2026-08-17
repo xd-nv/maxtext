@@ -127,6 +127,13 @@ class TestEtp1ParameterShardingRequirements(unittest.TestCase):
     path = "['params']['decoder']['moe_layers']['MoeBlock_0']['wi_0']"
     self.assertEqual(te_ep_etp1_required_mesh_axes(path), {"expert"})
 
+  def test_compound_etp1_requires_expert_and_fsdp_axes(self):
+    path = "['params']['decoder']['moe_layers']['MoeBlock_0']['wo']"
+    self.assertEqual(
+        te_ep_etp1_required_mesh_axes(path, require_fsdp=True),
+        {"expert", "fsdp"},
+    )
+
   def test_attention_parameter_uses_default_requirements(self):
     path = "['params']['decoder']['moe_layers']['self_attention']['wq_a']['kernel']"
     self.assertIsNone(te_ep_etp1_required_mesh_axes(path))
