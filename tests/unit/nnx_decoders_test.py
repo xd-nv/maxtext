@@ -36,6 +36,10 @@ from maxtext.common.common_types import DECODING_ACTIVE_SEQUENCE_INDICATOR, MODE
 from maxtext.configs import pyconfig
 from maxtext.layers import linears
 from maxtext.layers.attentions import Attention
+from maxtext.layers.decoders import (
+    _assert_compound_etp1_moe_scan_layout,
+    _linen_scan_parameter_axis,
+)
 from maxtext.layers.embeddings import Embed
 from maxtext.layers.nnx_decoders import (
     NNXDecoder,
@@ -104,7 +108,7 @@ class _ToyMoeContainer(nnx.Module):
 class _ToyLayer(nnx.Module):
 
   def __init__(self):
-    self.moe = _ToyMoeContainer()
+    self.DeepSeekMoeBlock_0 = _ToyMoeContainer()
     self.dense = nnx.Param(jnp.ones((8, 16)), sharding=(None, None))
 
 
@@ -124,9 +128,42 @@ class TestCompoundEtp1ScanLayout(unittest.TestCase):
 
   def test_routed_expert_filter_excludes_router_and_dense_params(self):
     param = nnx.Param(jnp.ones(()))
-    self.assertTrue(_is_routed_expert_param(("moe", "MoeBlock_0", "wi"), param))
-    self.assertFalse(_is_routed_expert_param(("moe", "MoeBlock_0", "router"), param))
+    self.assertTrue(
+        _is_routed_expert_param(
+            ("DeepSeekMoeBlock_0", "MoeBlock_0", "wi"), param
+        )
+    )
+    self.assertFalse(
+        _is_routed_expert_param(
+            ("DeepSeekMoeBlock_0", "MoeBlock_0", "router"), param
+        )
+    )
     self.assertFalse(_is_routed_expert_param(("shared_experts", "wi"), param))
+
+  def test_filter_receives_string_paths_and_split_selects_real_graph_state(self):
+    seen_paths = []
+
+    def capture_path(path, variable):
+      seen_paths.append(path)
+      return _is_routed_expert_param(path, variable)
+
+    _, routed, ordinary, _ = nnx.split(
+        _ToyLayer(), capture_path, nnx.Param, ...
+    )
+
+    self.assertIn(
+        ("DeepSeekMoeBlock_0", "MoeBlock_0", "wi"),
+        seen_paths,
+    )
+    self.assertTrue(all(isinstance(part, str) for path in seen_paths for part in path))
+    self.assertEqual(
+        routed["DeepSeekMoeBlock_0"]["MoeBlock_0"]["wi"].shape,
+        (4, 8, 16),
+    )
+    self.assertEqual(
+        ordinary["DeepSeekMoeBlock_0"]["MoeBlock_0"]["router"].shape,
+        (8, 4),
+    )
 
   def test_only_compound_etp1_uses_layer_major_expert_axis(self):
     self.assertEqual(_routed_expert_scan_axis(self._config()), 0)
@@ -150,12 +187,18 @@ class TestCompoundEtp1ScanLayout(unittest.TestCase):
         transform_metadata={nnx.PARTITION_NAME: "layers"},
     )(jnp.arange(layers))
 
-    self.assertEqual(stacked.moe.MoeBlock_0.wi.shape, (layers, 4, 8, 16))
     self.assertEqual(
-        stacked.moe.MoeBlock_0.wi.sharding,
+        stacked.DeepSeekMoeBlock_0.MoeBlock_0.wi.shape,
+        (layers, 4, 8, 16),
+    )
+    self.assertEqual(
+        stacked.DeepSeekMoeBlock_0.MoeBlock_0.wi.sharding,
         ("layers", "exp", "embed_moe", None),
     )
-    self.assertEqual(stacked.moe.MoeBlock_0.router.shape, (8, layers, 4))
+    self.assertEqual(
+        stacked.DeepSeekMoeBlock_0.MoeBlock_0.router.shape,
+        (8, layers, 4),
+    )
     self.assertEqual(stacked.dense.shape, (8, layers, 16))
 
   def test_legacy_scan_layout_remains_expert_major(self):
@@ -168,11 +211,73 @@ class TestCompoundEtp1ScanLayout(unittest.TestCase):
         transform_metadata={nnx.PARTITION_NAME: "layers"},
     )(jnp.arange(3))
 
-    self.assertEqual(stacked.moe.MoeBlock_0.wi.shape, (4, 3, 8, 16))
     self.assertEqual(
-        stacked.moe.MoeBlock_0.wi.sharding,
+        stacked.DeepSeekMoeBlock_0.MoeBlock_0.wi.shape,
+        (4, 3, 8, 16),
+    )
+    self.assertEqual(
+        stacked.DeepSeekMoeBlock_0.MoeBlock_0.wi.sharding,
         ("exp", "layers", "embed_moe", None),
     )
+
+
+class TestLinenCompoundEtp1ScanLayout(unittest.TestCase):
+  """The pretrain Linen scan must stack compound ETP1 MoE params on axis 0."""
+
+  @staticmethod
+  def _config(**overrides):
+    values = {
+        "use_te_ep": True,
+        "te_ep_compound_tensor_expert": True,
+        "te_ep_expert_tensor_parallelism": 1,
+        "param_scan_axis": 1,
+        "num_experts": 4,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+  def test_linen_moe_scan_uses_axis_zero_only_for_compound_etp1(self):
+    self.assertEqual(_linen_scan_parameter_axis(self._config(), "moe_layers"), 0)
+    self.assertEqual(_linen_scan_parameter_axis(self._config(), "dense_layers"), 1)
+    self.assertEqual(
+        _linen_scan_parameter_axis(
+            self._config(te_ep_compound_tensor_expert=False), "moe_layers"
+        ),
+        1,
+    )
+    self.assertEqual(
+        _linen_scan_parameter_axis(
+            self._config(te_ep_expert_tensor_parallelism=0), "moe_layers"
+        ),
+        1,
+    )
+
+  def test_early_layout_invariant_accepts_actual_deepseek_parameter_path(self):
+    params = {
+        "DeepSeekMoeBlock_0": {
+            "MoeBlock_0": {
+                "wi": SimpleNamespace(
+                    value=jnp.ones((3, 4, 8, 16)),
+                    names=("moe_layers", "exp", "embed_moe", None),
+                )
+            }
+        }
+    }
+    _assert_compound_etp1_moe_scan_layout(params, self._config(), 3)
+
+  def test_early_layout_invariant_rejects_expert_major_stack(self):
+    params = {
+        "DeepSeekMoeBlock_0": {
+            "MoeBlock_0": {
+                "wi": SimpleNamespace(
+                    value=jnp.ones((4, 3, 8, 16)),
+                    names=("exp", "layers", "embed_moe", None),
+                )
+            }
+        }
+    }
+    with self.assertRaisesRegex(ValueError, "must be layer-major"):
+      _assert_compound_etp1_moe_scan_layout(params, self._config(), 3)
 
 
 # ---------------------------------------------------------------------------

@@ -294,6 +294,48 @@ def deepstack_process(hidden_states, bidirectional_mask, visual_embeds):
   return hidden_states
 
 
+def _compound_etp1_uses_layer_major_moe_scan(cfg, metadata_axis_name):
+  """Whether this Linen scan must stack its MoE parameters layer-first."""
+  return (
+      metadata_axis_name == "moe_layers"
+      and cfg.use_te_ep
+      and cfg.te_ep_compound_tensor_expert
+      and cfg.te_ep_expert_tensor_parallelism == 1
+  )
+
+
+def _linen_scan_parameter_axis(cfg, metadata_axis_name):
+  """Resolve the at-rest parameter scan axis for a Linen layer stack."""
+  if _compound_etp1_uses_layer_major_moe_scan(cfg, metadata_axis_name):
+    return 0
+  return cfg.param_scan_axis
+
+
+def _assert_compound_etp1_moe_scan_layout(moe_params, cfg, num_moe_layers):
+  """Fail before compilation if routed expert weights are not layer-major."""
+  routed_params = moe_params["DeepSeekMoeBlock_0"]["MoeBlock_0"]
+  weight_name = "wi" if "wi" in routed_params else "wi_0"
+  weight = routed_params[weight_name]
+  value = getattr(weight, "value", weight)
+  names = getattr(weight, "names", None)
+  expected_prefix = (num_moe_layers, cfg.num_experts)
+  if tuple(value.shape[:2]) != expected_prefix:
+    raise ValueError(
+        "Compound ETP1 routed experts must be layer-major before compilation: "
+        f"expected {weight_name}.shape[:2]={expected_prefix}, got {tuple(value.shape[:2])}; "
+        f"full shape={tuple(value.shape)}, logical axes={names}"
+    )
+  if names is not None and tuple(names[:2]) != ("moe_layers", "exp"):
+    raise ValueError(
+        "Compound ETP1 routed expert scan metadata must begin with ('moe_layers', 'exp'): "
+        f"got {tuple(names)} for {weight_name}"
+    )
+  max_logging.log(
+      "MAXTEXT_COMPOUND_ETP1_SCAN_LAYOUT "
+      f"moe_layers params_axis=0 {weight_name}_shape={tuple(value.shape)} logical_axes={names}"
+  )
+
+
 class Decoder(nn.Module):
   """A stack of decoder layers as a part of an encoder-decoder architecture."""
 
@@ -557,7 +599,8 @@ class Decoder(nn.Module):
   def scan_decoder_layers(self, cfg, decoder_layer, length, metadata_axis_name, mesh, in_axes_tuple, **kwargs):
     """scan decoder layers, calls `flax.linen.transforms.scan`"""
     initializing = self.is_mutable_collection("params")
-    params_spec = cfg.param_scan_axis if initializing else ScanIn(cfg.param_scan_axis)
+    parameter_axis = _linen_scan_parameter_axis(cfg, metadata_axis_name)
+    params_spec = parameter_axis if initializing else ScanIn(parameter_axis)
     cache_spec = 0
     scan_fn = nn.scan(
         decoder_layer,
@@ -954,6 +997,13 @@ class Decoder(nn.Module):
                     in_axes_tuple=(nn.broadcast,) * len(broadcast_args) + (0,),
                     model_mode=model_mode,
                 )(y, *broadcast_args, layer_indices)
+                if (
+                    self.is_mutable_collection("params")
+                    and _compound_etp1_uses_layer_major_moe_scan(cfg, "moe_layers")
+                ):
+                  _assert_compound_etp1_moe_scan_layout(
+                      self.variables["params"]["moe_layers"], cfg, num_moe_layers
+                  )
               else:
                 y, _ = self.scan_decoder_layers(
                     cfg,
