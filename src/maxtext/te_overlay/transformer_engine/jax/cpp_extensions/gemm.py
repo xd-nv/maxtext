@@ -104,6 +104,24 @@ def sanitize_dims(ndim: int, dims: Union[int, Sequence[int]]) -> Sequence[int]:
     return tuple(ndim + dim if dim < 0 else dim for dim in dims_ if dim is not None)
 
 
+def _subtract_spec_axes(spec, other_specs):
+    """Remove mesh axes present in other specs while preserving partial compounds."""
+    if spec is None:
+        return None
+    other_axes = {
+        axis
+        for other_spec in other_specs
+        if other_spec is not None
+        for axis in (other_spec if isinstance(other_spec, tuple) else (other_spec,))
+    }
+    remaining = tuple(
+        axis for axis in (spec if isinstance(spec, tuple) else (spec,)) if axis not in other_axes
+    )
+    if not remaining:
+        return None
+    return remaining[0] if len(remaining) == 1 else remaining
+
+
 def get_non_contracting_dims(ndim, contracting_dims):
     """Return a tuple of dimensions not included in the contracting dimensions."""
     contracting_dims = sanitize_dims(ndim, contracting_dims)
@@ -997,13 +1015,11 @@ class GemmPrimitive(BasePrimitive):
             # Non-contracting dims of LHS to be gathered along the SP axis.
             # Minor note: This causes MaxText TP (= Megatron TP + activation_hidden sharding) gathering x for
             # dW1 = x^T * dY1 which is unexpected. This is a known issue and no solution has found yet.
-            # Flatten cspecs since a single element can be a tuple of mesh axes (e.g. ("data", "fsdp")).
-            flattened_rhs_non_cspecs = []
-            for spec in rhs_non_cspecs:
-                flattened_rhs_non_cspecs.extend(spec if isinstance(spec, tuple) else [spec])
+            # Remove only overlapping mesh axes. A compound LHS spec such as
+            # ("expert", "tensor") overlapping RHS "tensor" must retain
+            # "expert", rather than duplicating "tensor" in the GEMM output.
             lhs_non_cspecs = tuple(
-                None if spec in flattened_rhs_non_cspecs or spec in rhs_non_cspecs else spec
-                for spec in lhs_non_cspecs
+                _subtract_spec_axes(spec, rhs_non_cspecs) for spec in lhs_non_cspecs
             )
 
         out_specs = lhs_non_cspecs + rhs_non_cspecs

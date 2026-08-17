@@ -67,6 +67,43 @@ from maxtext.utils.sharding import create_sharding
 # The network: Decoder Definitions
 # ------------------------------------------------------------------------------
 
+_ROUTED_EXPERT_PARAMETER_NAMES = frozenset(
+    ("wi", "wi_0", "wi_1", "wo", "wi_0_bias", "wi_1_bias", "wo_bias")
+)
+
+
+def _is_routed_expert_param(path, variable):
+  """Select routed-expert tensors without selecting the router or shared MLP."""
+  variable_type = getattr(variable, "type", type(variable))
+  return (
+      isinstance(variable_type, type)
+      and issubclass(variable_type, nnx.Param)
+      and "MoeBlock_0" in path
+      and path[-1] in _ROUTED_EXPERT_PARAMETER_NAMES
+  )
+
+
+def _routed_expert_scan_axis(config):
+  """Keep compound-EP ETP1 routed experts layer-major at rest."""
+  if (
+      config.use_te_ep
+      and config.te_ep_compound_tensor_expert
+      and config.te_ep_expert_tensor_parallelism == 1
+  ):
+    return 0
+  return config.param_scan_axis
+
+
+def _parameter_scan_axes(config):
+  """Return ordered NNX filters for routed and ordinary parameters."""
+  return nnx.StateAxes(
+      {
+          _is_routed_expert_param: _routed_expert_scan_axis(config),
+          nnx.Param: config.param_scan_axis,
+          ...: 0,
+      }
+  )
+
 
 class NNXDecoderLayer(nnx.Module):
   """
@@ -401,11 +438,10 @@ class NNXDecoder(nnx.Module):
     except:  # pylint: disable=bare-except
       pass
 
-    out_axes = nnx.StateAxes({nnx.Param: self.config.param_scan_axis, ...: 0})
     layers_vmapped = nnx.vmap(
         create_layer_fn,
         in_axes=0,
-        out_axes=out_axes,
+        out_axes=_parameter_scan_axes(self.config),
         axis_name="layers",
         transform_metadata={nnx.PARTITION_NAME: "layers"},
     )(forked_rngs)
@@ -432,14 +468,12 @@ class NNXDecoder(nnx.Module):
     """Runs the layer stack using nnx.scan."""
     policy = self.get_remat_policy()
     prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
-    graphdef, params, state = nnx.split(
-        layers, nnx.Param, ...
-    )  # state: the mutable state we carry (KV cache, RNGs, etc.)
+    graphdef, routed_expert_params, params, state = nnx.split(
+        layers, _is_routed_expert_param, nnx.Param, ...
+    )  # state: mutable non-parameter state carried through the scan.
 
-    scan_axis = self.config.param_scan_axis
-    if scan_axis != 0:
-      # Move scan_axis to 0 so scan can iterate over it
-      params = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0), params)
+    param_scan_axis = self.config.param_scan_axis
+    routed_expert_scan_axis = _routed_expert_scan_axis(self.config)
 
     layer_cls = layers.__class__
     sig = inspect.signature(layer_cls.__call__)
@@ -451,35 +485,46 @@ class NNXDecoder(nnx.Module):
     valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters or "kwargs" in sig.parameters}
 
     def layer_fn(carry, scanned_vars):
-      # Unpack the sliced variables for THIS layer
-      current_params, current_state = scanned_vars
+      # Index mixed-axis parameters directly. Moving the complete parameter
+      # trees to axis 0 materializes the full scanned expert-weight transpose.
+      layer_idx, current_state = scanned_vars
+      current_routed_expert_params = jax.tree.map(
+          lambda x: jax.lax.dynamic_index_in_dim(
+              x, layer_idx, axis=routed_expert_scan_axis, keepdims=False
+          ),
+          routed_expert_params,
+      )
+      current_params = jax.tree.map(
+          lambda x: jax.lax.dynamic_index_in_dim(
+              x, layer_idx, axis=param_scan_axis, keepdims=False
+          ),
+          params,
+      )
 
       if self.config.parameter_memory_host_offload:
+        current_routed_expert_params = jax.tree.map(
+            lambda x: jax.device_put(x, max_utils.device_space()), current_routed_expert_params
+        )
         current_params = jax.tree.map(lambda x: jax.device_put(x, max_utils.device_space()), current_params)
 
       # Merge using the SLICED state
-      layer = nnx.merge(graphdef, current_params, current_state)
+      layer = nnx.merge(graphdef, current_routed_expert_params, current_params, current_state)
 
       # Run the layer (Filter kwargs if using the solution from previous turn)
       layer_out = layer(carry, *args, **valid_kwargs)
 
       new_carry = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
-      # Extract the updated state to return it
-      # _, new_current_state = nnx.split(layer, nnx.Param, ...)
-      new_current_state = nnx.state(layer)
+      # Parameters are immutable here. Returning them as scan outputs would
+      # restack the complete expert tensors after every decoder invocation.
+      _, _, _, new_current_state = nnx.split(layer, _is_routed_expert_param, nnx.Param, ...)
       return new_carry, new_current_state
 
     layer_fn = jax.checkpoint(layer_fn, policy=policy, prevent_cse=prevent_cse)
 
-    final_carry, scanned_state = jax.lax.scan(layer_fn, x_in, (params, state))
+    final_carry, scanned_state = jax.lax.scan(layer_fn, x_in, (jnp.arange(length), state))
 
-    if scan_axis != 0:
-      scanned_params, scanned_other = scanned_state.split(nnx.Param, ...)
-      scanned_params = jax.tree.map(lambda x: jnp.moveaxis(x, 0, scan_axis), scanned_params)
-      scanned_state = nnx.State.merge(scanned_params, scanned_other)
-
-    return final_carry, nnx.merge(graphdef, scanned_state)
+    return final_carry, nnx.merge(graphdef, routed_expert_params, params, scanned_state)
 
   def get_decoder_layers(self):
     """Retrieves decoder layer classes based on config using a dictionary lookup."""

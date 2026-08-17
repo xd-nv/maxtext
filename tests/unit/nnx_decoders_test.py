@@ -23,6 +23,7 @@ Tests cover:
 
 import sys
 import unittest
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -36,7 +37,14 @@ from maxtext.configs import pyconfig
 from maxtext.layers import linears
 from maxtext.layers.attentions import Attention
 from maxtext.layers.embeddings import Embed
-from maxtext.layers.nnx_decoders import NNXDecoder, NNXDecoderLayer, deepstack_process
+from maxtext.layers.nnx_decoders import (
+    NNXDecoder,
+    NNXDecoderLayer,
+    _is_routed_expert_param,
+    _parameter_scan_axes,
+    _routed_expert_scan_axis,
+    deepstack_process,
+)
 from maxtext.layers.normalizations import RMSNorm
 from maxtext.models.gpt3 import Gpt3LayerNorm
 from maxtext.models.llama2 import LlamaDecoderLayer
@@ -77,6 +85,94 @@ def _make_config(**overrides):
 def _make_mesh(cfg):
   devices_array = maxtext_utils.create_device_mesh(cfg)
   return Mesh(devices_array, cfg.mesh_axes)
+
+
+class _ToyRoutedMoE(nnx.Module):
+
+  def __init__(self):
+    self.wi = nnx.Param(jnp.ones((4, 8, 16)), sharding=("exp", "embed_moe", None))
+    self.wo = nnx.Param(jnp.ones((4, 16, 8)), sharding=("exp", None, "embed_moe"))
+    self.router = nnx.Param(jnp.ones((8, 4)), sharding=(None, "exp"))
+
+
+class _ToyMoeContainer(nnx.Module):
+
+  def __init__(self):
+    self.MoeBlock_0 = _ToyRoutedMoE()
+
+
+class _ToyLayer(nnx.Module):
+
+  def __init__(self):
+    self.moe = _ToyMoeContainer()
+    self.dense = nnx.Param(jnp.ones((8, 16)), sharding=(None, None))
+
+
+class TestCompoundEtp1ScanLayout(unittest.TestCase):
+  """Compound ETP1 must not stack routed experts expert-major."""
+
+  @staticmethod
+  def _config(**overrides):
+    values = {
+        "use_te_ep": True,
+        "te_ep_compound_tensor_expert": True,
+        "te_ep_expert_tensor_parallelism": 1,
+        "param_scan_axis": 1,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+  def test_routed_expert_filter_excludes_router_and_dense_params(self):
+    param = nnx.Param(jnp.ones(()))
+    self.assertTrue(_is_routed_expert_param(("moe", "MoeBlock_0", "wi"), param))
+    self.assertFalse(_is_routed_expert_param(("moe", "MoeBlock_0", "router"), param))
+    self.assertFalse(_is_routed_expert_param(("shared_experts", "wi"), param))
+
+  def test_only_compound_etp1_uses_layer_major_expert_axis(self):
+    self.assertEqual(_routed_expert_scan_axis(self._config()), 0)
+    self.assertEqual(
+        _routed_expert_scan_axis(self._config(te_ep_compound_tensor_expert=False)),
+        1,
+    )
+    self.assertEqual(
+        _routed_expert_scan_axis(self._config(te_ep_expert_tensor_parallelism=0)),
+        1,
+    )
+    self.assertEqual(_routed_expert_scan_axis(self._config(use_te_ep=False)), 1)
+
+  def test_compound_etp1_stacks_expert_weights_layer_major(self):
+    layers = 3
+    stacked = nnx.vmap(
+        lambda _rng: _ToyLayer(),
+        in_axes=0,
+        out_axes=_parameter_scan_axes(self._config()),
+        axis_name="layers",
+        transform_metadata={nnx.PARTITION_NAME: "layers"},
+    )(jnp.arange(layers))
+
+    self.assertEqual(stacked.moe.MoeBlock_0.wi.shape, (layers, 4, 8, 16))
+    self.assertEqual(
+        stacked.moe.MoeBlock_0.wi.sharding,
+        ("layers", "exp", "embed_moe", None),
+    )
+    self.assertEqual(stacked.moe.MoeBlock_0.router.shape, (8, layers, 4))
+    self.assertEqual(stacked.dense.shape, (8, layers, 16))
+
+  def test_legacy_scan_layout_remains_expert_major(self):
+    config = self._config(te_ep_compound_tensor_expert=False)
+    stacked = nnx.vmap(
+        lambda _rng: _ToyLayer(),
+        in_axes=0,
+        out_axes=_parameter_scan_axes(config),
+        axis_name="layers",
+        transform_metadata={nnx.PARTITION_NAME: "layers"},
+    )(jnp.arange(3))
+
+    self.assertEqual(stacked.moe.MoeBlock_0.wi.shape, (4, 3, 8, 16))
+    self.assertEqual(
+        stacked.moe.MoeBlock_0.wi.sharding,
+        ("exp", "layers", "embed_moe", None),
+    )
 
 
 # ---------------------------------------------------------------------------
