@@ -61,6 +61,36 @@ class TeEpEtp1KernelAxesTest(unittest.TestCase):
     self.assertEqual(wi_axes, ("exp", None, None))
     self.assertEqual(wo_axes, ("exp", None, None))
 
+  def test_compound_execution_specs_use_tensor_and_expert(self):
+    config = SimpleNamespace(te_ep_compound_tensor_expert=True)
+    self.assertEqual(
+        moe._te_ep_expert_partition_axis(config),
+        ("tensor", "expert"),
+    )
+
+  def test_legacy_execution_specs_keep_expert_only(self):
+    config = SimpleNamespace(te_ep_compound_tensor_expert=False)
+    self.assertEqual(moe._te_ep_expert_partition_axis(config), "expert")
+
+  def test_active_fsdp_shards_biases_at_rest(self):
+    mesh = SimpleNamespace(shape={"fsdp": 2})
+    self.assertEqual(moe.get_te_ep_etp1_bias_axes(mesh), ("exp", "embed_moe"))
+
+  def test_compound_runtime_specs_gather_fsdp_at_rest(self):
+    mesh = SimpleNamespace(shape={"tensor": 4, "expert": 4, "fsdp": 2})
+    config = SimpleNamespace(te_ep_compound_tensor_expert=True)
+    wi_axes, wo_axes = moe.get_te_ep_etp1_kernel_axes(mesh)
+    runtime_axis = moe._te_ep_expert_partition_axis(config)
+
+    # At rest, embed_moe maps to FSDP; the shard_map runtime spec intentionally
+    # omits FSDP, inducing its all-gather while retaining compound EP sharding.
+    self.assertEqual(wi_axes, ("exp", "embed_moe", None))
+    self.assertEqual(wo_axes, ("exp", None, "embed_moe"))
+    self.assertEqual(
+        jax.sharding.PartitionSpec(runtime_axis, None, None),
+        jax.sharding.PartitionSpec(("tensor", "expert"), None, None),
+    )
+
 
 class TokenDroppingTest(unittest.TestCase):
 

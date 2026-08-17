@@ -195,6 +195,32 @@ class MeshResourceTest(unittest.TestCase):
         {"ep_resource": "expert", "dp_resource": "tensor", "fsdp_resource": "fsdp"},
     )
 
+  def test_compound_ep_resource_keeps_fsdp_outer(self):
+    class FakeMeshResource:
+
+      def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    transformer_engine = ModuleType("transformer_engine")
+    transformer_engine.__path__ = []
+    transformer_engine_jax = ModuleType("transformer_engine.jax")
+    transformer_engine_jax.__path__ = []
+    sharding = ModuleType("transformer_engine.jax.sharding")
+    sharding.MeshResource = FakeMeshResource
+    modules = {
+        "transformer_engine": transformer_engine,
+        "transformer_engine.jax": transformer_engine_jax,
+        "transformer_engine.jax.sharding": sharding,
+    }
+    with patch.dict(sys.modules, modules):
+      resource = te_ep_init._build_mesh_resource(
+          ("fsdp",), ("tensor", "expert"), None
+      )
+    self.assertEqual(
+        resource.kwargs,
+        {"ep_resource": ("tensor", "expert"), "fsdp_resource": "fsdp"},
+    )
+
 
 class BuildTeEpStateTest(unittest.TestCase):
   """Pure-Python TE EP state construction checks."""
@@ -214,6 +240,7 @@ class BuildTeEpStateTest(unittest.TestCase):
         te_ep_max_num_sms=0,
         te_ep_em_unfused_num_sms=-1,
         te_ep_expert_tensor_parallelism=0,
+        te_ep_compound_tensor_expert=False,
         te_ep_drop_on_overflow=False,
     )
 
@@ -294,6 +321,49 @@ class BuildTeEpStateTest(unittest.TestCase):
     mesh = SimpleNamespace(shape={"fsdp": 4, "expert": 4, "tensor": 2})
 
     with self.assertRaisesRegex(ValueError, "must be 0 .* or 1"):
+      te_ep_init.build_te_ep_state(config, mesh)
+
+  def test_compound_primary_topologies(self):
+    for expert_size in (2, 4, 8):
+      with self.subTest(expert_size=expert_size):
+        config = self._config()
+        config.te_ep_expert_tensor_parallelism = 1
+        config.te_ep_compound_tensor_expert = True
+        mesh = SimpleNamespace(shape={"tensor": 8, "expert": expert_size})
+        with patch.object(te_ep_init, "_build_mesh_resource", return_value="resource"):
+          state = te_ep_init.build_te_ep_state(config, mesh)
+        self.assertEqual(state.ep_axes, ("tensor", "expert"))
+        self.assertTrue(state.uses_compound_ep)
+        self.assertEqual(state.ep_size, 8 * expert_size)
+        self.assertEqual(state.outer_axes, ())
+        self.assertEqual(state.tensor_size, 1)
+        self.assertEqual(state.expected_world_size, 8 * expert_size)
+        self.assertEqual(state.num_local_experts, 256 // (8 * expert_size))
+        leading = ("tensor", "expert")
+        self.assertEqual(state.routing_spec_2d, te_ep_init.PartitionSpec(leading, None))
+        self.assertEqual(state.input_spec_3d, te_ep_init.PartitionSpec(leading, None, None))
+
+  def test_compound_ep16_with_outer_fsdp2(self):
+    config = self._config()
+    config.te_ep_expert_tensor_parallelism = 1
+    config.te_ep_compound_tensor_expert = True
+    mesh = SimpleNamespace(shape={"tensor": 4, "expert": 4, "fsdp": 2})
+    with patch.object(te_ep_init, "_build_mesh_resource", return_value="resource") as build_resource:
+      state = te_ep_init.build_te_ep_state(config, mesh)
+    build_resource.assert_called_once_with(("fsdp",), ("tensor", "expert"), None)
+    self.assertEqual(state.ep_size, 16)
+    self.assertEqual(state.outer_size, 2)
+    self.assertEqual(state.expected_world_size, 32)
+    self.assertEqual(
+        state.input_spec_2d,
+        te_ep_init.PartitionSpec(("fsdp", "tensor", "expert"), None),
+    )
+
+  def test_compound_requires_etp1(self):
+    config = self._config()
+    config.te_ep_compound_tensor_expert = True
+    mesh = SimpleNamespace(shape={"tensor": 4, "expert": 4})
+    with self.assertRaisesRegex(ValueError, "requires.*tensor_parallelism=1"):
       te_ep_init.build_te_ep_state(config, mesh)
 
 

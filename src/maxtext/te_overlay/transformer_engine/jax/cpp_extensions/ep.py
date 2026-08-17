@@ -141,21 +141,27 @@ def _leading_axis_ok(spec):
     rank view that differs from dense GEMMs in the same program.
     """
     gsr = global_mesh_resource()
-    ep_axis = gsr.ep_resource
-    if len(spec) < 2 or ep_axis is None:
-        return False, ep_axis, ()
+    ep_axes = _normalize_axes(gsr.ep_resource)
+    if len(spec) < 2 or not ep_axes:
+        return False, gsr.ep_resource, ()
     if any(ax is not None for ax in spec[1:]):
-        return False, ep_axis, ()
+        return False, gsr.ep_resource, ()
     leading = spec[0]
     elts = leading if isinstance(leading, tuple) else (leading,)
-    if ep_axis not in elts:
-        return False, ep_axis, ()
-    outer_axes = tuple(a for a in elts if a is not None and a != ep_axis)
-    return True, ep_axis, outer_axes
+    if not set(ep_axes).issubset(elts):
+        return False, gsr.ep_resource, ()
+    outer_axes = tuple(a for a in elts if a is not None and a not in ep_axes)
+    return len(set(elts)) == len(elts), gsr.ep_resource, outer_axes
+
+
+def _normalize_axes(axes):
+    if axes is None:
+        return ()
+    return (axes,) if isinstance(axes, str) else tuple(axes)
 
 
 def _ep_outer_axis():
-    """The single dp/fsdp axis (if any) sitting outside ep on EP-output tensors.
+    """DP/FSDP axes sitting outside EP on EP-output tensors.
 
     When set, EP-output globals carry an extra leading ``dp_size`` dim so SPMD
     sees each DP color's slab as distinct (rather than replicated across DP).
@@ -164,11 +170,18 @@ def _ep_outer_axis():
     we don't pin EP-output specs to a degenerate axis that JAX may collapse.
     """
     gsr = global_mesh_resource()
-    if gsr.dp_resource is not None and get_mesh_axis_size(gsr.dp_resource) > 1:
-        return gsr.dp_resource
-    if gsr.fsdp_resource is not None and get_mesh_axis_size(gsr.fsdp_resource) > 1:
-        return gsr.fsdp_resource
-    return gsr.dp_resource or gsr.fsdp_resource
+    ep_axes = set(_normalize_axes(gsr.ep_resource))
+    outer_axes = tuple(
+        dict.fromkeys(
+            axis
+            for resource in (gsr.dp_resource, gsr.fsdp_resource)
+            for axis in _normalize_axes(resource)
+            if axis not in ep_axes and get_mesh_axis_size(axis) > 1
+        )
+    )
+    if not outer_axes:
+        return None
+    return outer_axes[0] if len(outer_axes) == 1 else outer_axes
 
 
 def _ep_leading_dims(is_outer):
@@ -184,10 +197,9 @@ def _ep_output_spec(*trailing):
     """PartitionSpec for an EP-output tensor: ``(("dp","ep"), *trailing)`` when
     DP is set (compound leading axis on a single dim), else ``("ep",*trailing)``."""
     gsr = global_mesh_resource()
-    outer = _ep_outer_axis()
-    if outer is None:
-        return PartitionSpec(gsr.ep_resource, *trailing)
-    return PartitionSpec((outer, gsr.ep_resource), *trailing)
+    leading = (*_normalize_axes(_ep_outer_axis()), *_normalize_axes(gsr.ep_resource))
+    leading_spec = leading[0] if len(leading) == 1 else leading
+    return PartitionSpec(leading_spec, *trailing)
 
 
 def _ep_spec_ok(spec, trailing_count):
@@ -197,15 +209,15 @@ def _ep_spec_ok(spec, trailing_count):
     every trailing dimension must remain replicated.
     """
     gsr = global_mesh_resource()
-    ep_axis = gsr.ep_resource
-    if ep_axis is None or len(spec) != 1 + trailing_count:
+    ep_axes = set(_normalize_axes(gsr.ep_resource))
+    if not ep_axes or len(spec) != 1 + trailing_count:
         return False
     if any(ax is not None for ax in spec[1:]):
         return False
     leading = spec[0]
     elts = leading if isinstance(leading, tuple) else (leading,)
     actual = frozenset(a for a in elts if a is not None)
-    return ep_axis in actual
+    return ep_axes.issubset(actual)
 
 
 # ── ep_prepare ──────────────────────────────────────────────────────────────
@@ -902,7 +914,7 @@ class EpCombineBwdPrimitive(BasePrimitive):
         del is_outer, result_infos
         arg_shardings = tuple(a.sharding for a in arg_infos)
         # The combine cotangent carries the source-token leading sharding.
-        # Preserve it instead of consulting the single global dp/fsdp role.
+        # Preserve it instead of reconstructing it from global DP/FSDP roles.
         grad_spec = arg_infos[1].sharding.spec
         if len(grad_spec) < 2 or grad_spec[0] is None:
             raise NotImplementedError(

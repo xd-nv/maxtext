@@ -1,11 +1,10 @@
 diff --git a/transformer_engine/jax/cpp_extensions/ep.py b/transformer_engine/jax/cpp_extensions/ep.py
-index ca70ea14..5d03459a 100644
+index ca70ea14..85f92190 100644
 --- a/transformer_engine/jax/cpp_extensions/ep.py
 +++ b/transformer_engine/jax/cpp_extensions/ep.py
-@@ -135,22 +135,23 @@ def ep_handle_mem_size(cfg: EpLayerConfig) -> int:
- def _leading_axis_ok(spec):
+@@ -136,24 +136,31 @@ def _leading_axis_ok(spec):
      """Validate an EP input spec; return ``(ok, ep_axis, outer_axes)``.
- 
+
 -    Leading dim is ``ep`` or a tuple ending in ``ep`` (outer dp/fsdp axes
 -    first); all other dims must be replicated.
 +    Leading dim is ``ep`` or a tuple containing ``ep`` plus any operand-local
@@ -14,29 +13,73 @@ index ca70ea14..5d03459a 100644
 +    rank view that differs from dense GEMMs in the same program.
      """
      gsr = global_mesh_resource()
-     ep_axis = gsr.ep_resource
+-    ep_axis = gsr.ep_resource
 -    outer_axes = tuple(a for a in (gsr.dp_resource, gsr.fsdp_resource) if a is not None)
-     if len(spec) < 2 or ep_axis is None:
+-    if len(spec) < 2 or ep_axis is None:
 -        return False, ep_axis, outer_axes
-+        return False, ep_axis, ()
++    ep_axes = _normalize_axes(gsr.ep_resource)
++    if len(spec) < 2 or not ep_axes:
++        return False, gsr.ep_resource, ()
      if any(ax is not None for ax in spec[1:]):
 -        return False, ep_axis, outer_axes
-+        return False, ep_axis, ()
++        return False, gsr.ep_resource, ()
      leading = spec[0]
      elts = leading if isinstance(leading, tuple) else (leading,)
-     if ep_axis not in elts:
+-    if ep_axis not in elts:
 -        return False, ep_axis, outer_axes
 -    allowed = set(outer_axes) | {ep_axis}
 -    return all(a in allowed for a in elts), ep_axis, outer_axes
-+        return False, ep_axis, ()
-+    outer_axes = tuple(a for a in elts if a is not None and a != ep_axis)
-+    return True, ep_axis, outer_axes
- 
- 
++    if not set(ep_axes).issubset(elts):
++        return False, gsr.ep_resource, ()
++    outer_axes = tuple(a for a in elts if a is not None and a not in ep_axes)
++    return len(set(elts)) == len(elts), gsr.ep_resource, outer_axes
++
++
++def _normalize_axes(axes):
++    if axes is None:
++        return ()
++    return (axes,) if isinstance(axes, str) else tuple(axes)
+
+
  def _ep_outer_axis():
-@@ -190,22 +191,21 @@ def _ep_output_spec(*trailing):
- 
- 
+-    """The single dp/fsdp axis (if any) sitting outside ep on EP-output tensors.
++    """DP/FSDP axes sitting outside EP on EP-output tensors.
+
+     When set, EP-output globals carry an extra leading ``dp_size`` dim so SPMD
+@@ -164,9 +171,16 @@ def _ep_outer_axis():
+     """
+     gsr = global_mesh_resource()
+-    if gsr.dp_resource is not None and get_mesh_axis_size(gsr.dp_resource) > 1:
+-        return gsr.dp_resource
+-    if gsr.fsdp_resource is not None and get_mesh_axis_size(gsr.fsdp_resource) > 1:
+-        return gsr.fsdp_resource
+-    return gsr.dp_resource or gsr.fsdp_resource
++    ep_axes = set(_normalize_axes(gsr.ep_resource))
++    outer_axes = tuple(
++        dict.fromkeys(
++            axis
++            for resource in (gsr.dp_resource, gsr.fsdp_resource)
++            for axis in _normalize_axes(resource)
++            if axis not in ep_axes and get_mesh_axis_size(axis) > 1
++        )
++    )
++    if not outer_axes:
++        return None
++    return outer_axes[0] if len(outer_axes) == 1 else outer_axes
+
+
+@@ -184,19 +198,18 @@ def _ep_output_spec(*trailing):
+     DP is set (compound leading axis on a single dim), else ``("ep",*trailing)``."""
+     gsr = global_mesh_resource()
+-    outer = _ep_outer_axis()
+-    if outer is None:
+-        return PartitionSpec(gsr.ep_resource, *trailing)
+-    return PartitionSpec((outer, gsr.ep_resource), *trailing)
++    leading = (*_normalize_axes(_ep_outer_axis()), *_normalize_axes(gsr.ep_resource))
++    leading_spec = leading[0] if len(leading) == 1 else leading
++    return PartitionSpec(leading_spec, *trailing)
+
+
  def _ep_spec_ok(spec, trailing_count):
 -    """Leading dim shards along ep (and outer dp/fsdp when set); trailing dims
 -    are replicated. JAX may collapse size-1 mesh axes to ``None`` or drop them,
@@ -47,30 +90,28 @@ index ca70ea14..5d03459a 100644
 +    every trailing dimension must remain replicated.
      """
      gsr = global_mesh_resource()
-     ep_axis = gsr.ep_resource
+-    ep_axis = gsr.ep_resource
 -    outer = _ep_outer_axis()
 -    if len(spec) != 1 + trailing_count:
-+    if ep_axis is None or len(spec) != 1 + trailing_count:
++    ep_axes = set(_normalize_axes(gsr.ep_resource))
++    if not ep_axes or len(spec) != 1 + trailing_count:
          return False
      if any(ax is not None for ax in spec[1:]):
-         return False
-     leading = spec[0]
+@@ -205,6 +218,5 @@ def _ep_spec_ok(spec, trailing_count):
      elts = leading if isinstance(leading, tuple) else (leading,)
      actual = frozenset(a for a in elts if a is not None)
 -    expected = {ep_axis} if outer is None else {ep_axis, outer}
 -    return actual <= expected
-+    return ep_axis in actual
- 
- 
- # ── ep_prepare ──────────────────────────────────────────────────────────────
-@@ -901,8 +901,15 @@ class EpCombineBwdPrimitive(BasePrimitive):
-     ):
++    return ep_axes.issubset(actual)
+
+
+@@ -902,6 +914,13 @@ class EpCombineBwdPrimitive(BasePrimitive):
          del is_outer, result_infos
          arg_shardings = tuple(a.sharding for a in arg_infos)
 -        # EP-output leading (trailing dims auto-pad to None).
 -        out_sharding = NamedSharding(mesh, _ep_output_spec())
 +        # The combine cotangent carries the source-token leading sharding.
-+        # Preserve it instead of consulting the single global dp/fsdp role.
++        # Preserve it instead of reconstructing it from global DP/FSDP roles.
 +        grad_spec = arg_infos[1].sharding.spec
 +        if len(grad_spec) < 2 or grad_spec[0] is None:
 +            raise NotImplementedError(
@@ -78,15 +119,13 @@ index ca70ea14..5d03459a 100644
 +                f" sharding; got spec={grad_spec}."
 +            )
 +        out_sharding = NamedSharding(mesh, PartitionSpec(grad_spec[0]))
- 
+
          def sharded_impl(handle_mem, grad):
-             return EpCombineBwdPrimitive.impl(
 diff --git a/transformer_engine/jax/cpp_extensions/gemm.py b/transformer_engine/jax/cpp_extensions/gemm.py
 index f56f03e4..428967b5 100644
 --- a/transformer_engine/jax/cpp_extensions/gemm.py
 +++ b/transformer_engine/jax/cpp_extensions/gemm.py
-@@ -1173,12 +1173,15 @@ class GemmPrimitive(BasePrimitive):
- 
+@@ -1174,10 +1174,13 @@ class GemmPrimitive(BasePrimitive):
              if reduce_spec is not None:
                  if not collective_op.is_reduce_scatter:
 +                    reduce_axes = reduce_spec if isinstance(reduce_spec, tuple) else (reduce_spec,)
@@ -102,34 +141,67 @@ index f56f03e4..428967b5 100644
 -                        output = jax.lax.psum(output, reduce_spec)
 +                        for axis in reduce_axes:
 +                            output = jax.lax.psum(output, axis)
- 
+
                  if has_bias:
-                     output += bias
 diff --git a/transformer_engine/jax/ep.py b/transformer_engine/jax/ep.py
-index 32074b49..88ee50a3 100644
+index 32074b49..297c2968 100644
 --- a/transformer_engine/jax/ep.py
 +++ b/transformer_engine/jax/ep.py
-@@ -65,7 +65,8 @@ def _allgather_uid(uid_arr, world_size, uid_size):
-     replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+@@ -42,4 +42,10 @@ _atexit_registered = False
+
+
++def _normalize_axes(axes):
++    if axes is None:
++        return ()
++    return (axes,) if isinstance(axes, str) else tuple(axes)
++
++
+ def _allgather_uid(uid_arr, world_size, uid_size):
+     """Allgather UID bytes across all processes.
+@@ -66,5 +72,6 @@ def _allgather_uid(uid_arr, world_size, uid_size):
      local = np.asarray(uid_arr).reshape(1, uid_size)
      g_in = jax.make_array_from_process_local_data(sharded, local, (world_size, uid_size))
 -    g_out = jax.jit(lambda x: x, out_shardings=replicated)(g_in)
 +    with jax.set_mesh(mesh):
 +        g_out = jax.jit(lambda x: x, out_shardings=replicated)(g_in)
      return np.asarray(g_out).reshape(world_size, uid_size)
- 
- 
-@@ -100,6 +101,21 @@ def _ep_domain_for_rank(mesh, ep_resource, rank, device_to_rank=None):
-     return int(grid[row, 0]), col, int(grid.shape[0])
- 
- 
+
+@@ -86,9 +93,19 @@ def _ep_domain_for_rank(mesh, ep_resource, rank, device_to_rank=None):
+             return d.process_index
+
+-    ep_pos = mesh.axis_names.index(ep_resource)
+-    ep_size = mesh.shape[ep_resource]
++    ep_axes = _normalize_axes(ep_resource)
++    if not ep_axes or len(set(ep_axes)) != len(ep_axes):
++        raise ValueError(f"ep_bootstrap: invalid ep_resource={ep_resource!r}.")
++    missing = tuple(axis for axis in ep_axes if axis not in mesh.axis_names)
++    if missing:
++        raise ValueError(
++            f"ep_bootstrap: EP axes {missing} are absent from mesh axes {mesh.axis_names}."
++        )
++    non_ep_axes = tuple(axis for axis in mesh.axis_names if axis not in ep_axes)
++    transpose_axes = tuple(mesh.axis_names.index(axis) for axis in (*non_ep_axes, *ep_axes))
++    ep_size = int(np.prod([mesh.shape[axis] for axis in ep_axes]))
+     ranks = np.vectorize(device_to_rank, otypes=[np.int64])(mesh.devices)
+-    # Move ep last and flatten: each row is one domain (all non-ep coords fixed).
+-    grid = np.moveaxis(ranks, ep_pos, -1).reshape(-1, ep_size)
++    # Flatten every EP axis into one communicator dimension. Each row fixes all
++    # non-EP coordinates and follows ep_resource tuple order within the domain.
++    grid = np.transpose(ranks, transpose_axes).reshape(-1, ep_size)
+     loc = np.argwhere(grid == rank)
+     if loc.shape[0] != 1:
+@@ -101,4 +118,21 @@ def _ep_domain_for_rank(mesh, ep_resource, rank, device_to_rank=None):
+
+
 +def _num_ep_output_groups(mesh_resource, axis_size_fn=get_mesh_axis_size):
-+    """Count distinct EP output slabs from DP/FSDP resources, excluding TP."""
++    """Count outer DP/FSDP output slabs not consumed by compound EP."""
++    ep_axes = set(_normalize_axes(getattr(mesh_resource, "ep_resource", None)))
 +    distinct_token_axes = tuple(
 +        dict.fromkeys(
 +            axis
-+            for axis in (mesh_resource.dp_resource, mesh_resource.fsdp_resource)
-+            if axis is not None
++            for resource in (mesh_resource.dp_resource, mesh_resource.fsdp_resource)
++            for axis in _normalize_axes(resource)
++            if axis not in ep_axes
 +        )
 +    )
 +    num_groups = 1
@@ -140,9 +212,7 @@ index 32074b49..88ee50a3 100644
 +
  def ep_bootstrap(
      world_size,
-     rank,
-@@ -168,15 +184,26 @@ def ep_bootstrap(
-             f" world_size ({world_size})."
+@@ -169,13 +203,24 @@ def ep_bootstrap(
          )
      ep_size = get_mesh_axis_size(ep_resource)
 -    # num_ep_groups counts only the distinct-token (dp/fsdp) axes; replicated
@@ -161,7 +231,7 @@ index 32074b49..88ee50a3 100644
 +    num_ep_groups = _num_ep_output_groups(gsr)
      if num_experts % ep_size != 0:
          raise ValueError(f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size}).")
- 
+
      UID_SIZE = 128
 -    root_rank, rank_within_group, _num_domains = _ep_domain_for_rank(mesh, ep_resource, rank)
 +    root_rank, rank_within_group, num_domains = _ep_domain_for_rank(mesh, ep_resource, rank)
@@ -172,11 +242,18 @@ index 32074b49..88ee50a3 100644
 +        )
      is_color_root = rank_within_group == 0
      if is_color_root:
-         libnccl = ctypes.CDLL("libnccl.so.2", use_errno=True)
-@@ -255,8 +282,15 @@ def _default_out_partition_spec():
- # ── ep_dispatch (custom_vjp) ─────────────────────────────────────────────────
- 
- 
+@@ -248,6 +293,6 @@ def _default_out_partition_spec():
+             "ep_resource is not set on the active MeshResource; pass out_sharding=... explicitly."
+         )
+-    outer = _ep_outer_axis()
+-    leading = (outer, gsr.ep_resource) if outer is not None else gsr.ep_resource
++    leading_axes = (*_normalize_axes(_ep_outer_axis()), *_normalize_axes(gsr.ep_resource))
++    leading = leading_axes[0] if len(leading_axes) == 1 else leading_axes
+     return (leading,)
+
+@@ -256,6 +301,13 @@ def _default_out_partition_spec():
+
+
 -@partial(jax.custom_vjp, nondiff_argnums=(0, 4))
 -def ep_dispatch(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
 +@partial(jax.custom_vjp, nondiff_argnums=(0, 4, 5))
@@ -189,10 +266,8 @@ index 32074b49..88ee50a3 100644
 +    out_sharding=None,
 +):
      """Scatter tokens and weights to expert ranks.
- 
-     ``cfg`` is a per-layer ``EpLayerConfig``; distinct layers may share a
-@@ -272,10 +306,24 @@ def ep_dispatch(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
-     the worst case, detect overflow by ``process_allgather``-ing it, then
+
+@@ -273,8 +325,22 @@ def ep_dispatch(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
      ``max(...) > recv_capacity_per_rank`` flags an overflowing step.
      """
 -    return _dispatch_fwd(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank)[0]
@@ -204,8 +279,8 @@ index 32074b49..88ee50a3 100644
 +        recv_capacity_per_rank,
 +        out_sharding,
 +    )[0]
- 
- 
+
+
 -def _dispatch_fwd(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
 +def _dispatch_fwd(
 +    cfg,
@@ -217,11 +292,9 @@ index 32074b49..88ee50a3 100644
 +):
      if not jnp.issubdtype(topk_weights.dtype, jnp.floating):
          raise TypeError(
-             f"ep_dispatch: topk_weights must be a floating dtype; got {topk_weights.dtype}."
-@@ -289,11 +337,11 @@ def _dispatch_fwd(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
-     return primal, (handle_mem, out_leading)
- 
- 
+@@ -290,9 +356,9 @@ def _dispatch_fwd(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
+
+
 -def _dispatch_bwd(cfg, recv_capacity_per_rank, res, g_outputs):
 +def _dispatch_bwd(cfg, recv_capacity_per_rank, out_sharding, res, g_outputs):
      del recv_capacity_per_rank
@@ -231,4 +304,330 @@ index 32074b49..88ee50a3 100644
 +    out_spec = _default_out_partition_spec() if out_sharding is None else out_sharding
      spec = jax.sharding.PartitionSpec(*out_spec)
      g_recv_tokens = with_sharding_constraint(g_outputs[0], spec)
-     g_recv_topk_weights = with_sharding_constraint(g_outputs[1], spec)
+diff --git a/transformer_engine/jax/moe.py b/transformer_engine/jax/moe.py
+index 21ef59ba..45753617 100644
+--- a/transformer_engine/jax/moe.py
++++ b/transformer_engine/jax/moe.py
+@@ -18,5 +18,5 @@ Sharding model
+ --------------
+ * Inbound activations are 3D ``[B, S, H]`` sharded
+-  ``((*data_parallelism_axes, ep_axis), None, None)``. The public
++  ``((*data_parallelism_axes, *ep_axes), None, None)``. The public
+   :func:`moe` soft-repins this on entry and warns when a reshard is
+   inserted.
+@@ -66,4 +66,66 @@ _ALIGN_SIZE = 128
+
+
++def _normalize_moe_mesh_axes(ep_axis, data_parallelism_axes=()):
++    """Return validated, flat EP and outer-DP physical mesh axes."""
++    if ep_axis is None:
++        raise ValueError("moe(...) requires ep_axis to be set (TE EP backend).")
++    ep_axes = (ep_axis,) if isinstance(ep_axis, str) else tuple(ep_axis)
++    if isinstance(data_parallelism_axes, str):
++        raise TypeError("moe(...): data_parallelism_axes must be a tuple of axis names.")
++    dp_axes = tuple(data_parallelism_axes)
++    if not ep_axes:
++        raise ValueError("moe(...) requires at least one EP mesh axis.")
++    if any(not isinstance(axis, str) for axis in ep_axes):
++        raise TypeError(f"moe(...): ep_axis must contain only flat string axes; got {ep_axes}.")
++    if any(not isinstance(axis, str) for axis in dp_axes):
++        raise TypeError(
++            "moe(...): data_parallelism_axes must contain only string axes; "
++            f"got {dp_axes}."
++        )
++    if len(set(ep_axes)) != len(ep_axes):
++        raise ValueError(f"moe(...): ep_axis contains duplicate axes: {ep_axes}.")
++    if len(set(dp_axes)) != len(dp_axes):
++        raise ValueError(
++            f"moe(...): data_parallelism_axes contains duplicate axes: {dp_axes}."
++        )
++    overlap = tuple(axis for axis in dp_axes if axis in set(ep_axes))
++    if overlap:
++        raise ValueError(
++            "moe(...): data_parallelism_axes and ep_axis must be disjoint; "
++            f"overlap={overlap}."
++        )
++    return ep_axes, dp_axes
++
++
++def _mesh_axes_size(mesh, axes, role):
++    """Product of physical mesh sizes for ``axes``, with a focused error."""
++    missing = tuple(axis for axis in axes if axis not in mesh.shape)
++    if missing:
++        raise ValueError(
++            f"moe(...): {role} axes {missing} are absent from mesh axes {tuple(mesh.shape)}."
++        )
++    size = 1
++    for axis in axes:
++        size *= int(mesh.shape[axis])
++    return size
++
++
++def _axis_resource(axes):
++    """JAX resource form: scalar for one axis, flat tuple for multiple axes."""
++    return axes[0] if len(axes) == 1 else tuple(axes)
++
++
++def _moe_partition_specs(ep_axis, data_parallelism_axes=(), *, has_bias=False):
++    """Construct flat leading and expert-parameter specs for MoE fwd/bwd."""
++    ep_axes, dp_axes = _normalize_moe_mesh_axes(ep_axis, data_parallelism_axes)
++    batch_resource = _axis_resource((*dp_axes, *ep_axes))
++    expert_resource = _axis_resource(ep_axes)
++    ep3_spec = P(batch_resource, None, None)
++    ep2_spec = P(batch_resource, None)
++    kernel_spec = P(expert_resource, None, None)
++    bias_spec = P(expert_resource, None) if has_bias else None
++    return ep_axes, dp_axes, batch_resource, ep3_spec, ep2_spec, kernel_spec, bias_spec
++
++
+ def _with_sharding_constraint_cast_bwd(x: jnp.ndarray, sharding) -> jnp.ndarray:
+     """Sharding constraint that keeps bwd cotangents in the primal dtype.
+@@ -490,14 +552,23 @@ def _moe_fwd_rule(
+     if mesh is None or mesh.empty:
+         raise ValueError("moe(...) requires an active jax.sharding.Mesh.")
+-    if ep_axis is None:
+-        raise ValueError("moe(...) requires ep_axis to be set (TE EP backend).")
+-    num_ep = mesh.shape[ep_axis]
++    (
++        ep_axes,
++        data_parallelism_axes,
++        batch_pspec_axis,
++        ep3_spec,
++        ep2_spec,
++        kernel_spec,
++        bias_spec,
++    ) = _moe_partition_specs(
++        ep_axis,
++        data_parallelism_axes,
++        has_bias=wi_0_bias is not None,
++    )
++    num_ep = _mesh_axes_size(mesh, ep_axes, "EP")
+     if num_experts % num_ep != 0:
+         raise ValueError(f"num_experts={num_experts} must be divisible by EP size={num_ep}")
+     num_local_experts = num_experts // num_ep
+
+-    dp_size = 1
+-    for ax in data_parallelism_axes:
+-        dp_size *= mesh.shape[ax]
++    dp_size = _mesh_axes_size(mesh, data_parallelism_axes, "data-parallel")
+     num_procs = num_ep * dp_size
+
+@@ -530,13 +601,6 @@ def _moe_fwd_rule(
+     )
+
+-    if not data_parallelism_axes:
+-        batch_pspec_axis: Any = ep_axis
+-    else:
+-        # ep must be innermost: ep_bootstrap forms NCCL EP comms from
+-        # consecutive global ranks (dp_color = rank // ep_size), so the
+-        # comm only stays within one model replica under (outer_dp, ep).
+-        batch_pspec_axis = (*data_parallelism_axes, ep_axis)
+-    ep3_spec = P(batch_pspec_axis, None, None)
+-    ep2_spec = P(batch_pspec_axis, None)
++    # Every EP axis is innermost after true outer DP axes. ep_bootstrap flattens
++    # the EP resources while fixing each non-EP coordinate.
+     x = jax.lax.with_sharding_constraint(x, NamedSharding(mesh, ep3_spec))
+
+@@ -625,5 +689,5 @@ def _moe_fwd_rule(
+     topk_idx_3d = selected_experts.reshape(B, S, K).astype(jnp.int32)
+     topk_w_3d = routing_weights.reshape(B, S, K).astype(jnp.float32)
+-    # tex.ep_prepare/dispatch's partition only folds ep_axis into a replicated
++    # tex.ep_prepare/dispatch's partition folds every EP axis into a replicated
+     # leading dim, not the outer dp/fsdp axes, so a replicated topk_idx makes
+     # each rank see B/ep rows (not B/num_procs) and overrun the bootstrap-sized
+@@ -649,6 +713,4 @@ def _moe_fwd_rule(
+     # ---------------- FFN (per-shard via shard_map) ----------------
+     has_bias = wi_0_bias is not None
+-    kernel_spec = P(ep_axis, None, None)
+-    bias_spec = P(ep_axis, None) if has_bias else None
+     # token_counts is the per-shard (1, num_local_experts) padded
+     # per-expert count from ep_prepare; piped into _ffn_fwd_per_shard
+@@ -671,9 +733,9 @@ def _moe_fwd_rule(
+     residuals_spec = (
+         P(),  # casted_sorted_x_lhs_trans
+-        P(ep_axis, None, None),  # casted_wi_rhs_trans
++        kernel_spec,  # casted_wi_rhs_trans
+         P(),  # gate_proj_out
+         P(),  # up_proj_out
+         P(),  # casted_intermediate_lhs_trans
+-        P(ep_axis, None, None),  # casted_wo_rhs_trans
++        kernel_spec,  # casted_wo_rhs_trans
+         ep2_spec,  # local_group_sizes (1, num_local_experts) per shard
+     )
+@@ -833,16 +895,16 @@ def _moe_bwd_rule(
+     if mesh is None or mesh.empty:
+         raise ValueError("moe(...) requires an active jax.sharding.Mesh.")
+-    dp_size = 1
+-    for ax in data_parallelism_axes:
+-        dp_size *= mesh.shape[ax]
++    (
++        _ep_axes,
++        data_parallelism_axes,
++        batch_pspec_axis,
++        ep3_spec,
++        ep2_spec,
++        kernel_spec,
++        bias_spec,
++    ) = _moe_partition_specs(ep_axis, data_parallelism_axes, has_bias=has_bias)
+
+     B, S, _ = x_shape
+     K = num_experts_per_tok
+-    if not data_parallelism_axes:
+-        batch_pspec_axis: Any = ep_axis
+-    else:
+-        batch_pspec_axis = (*data_parallelism_axes, ep_axis)
+-    ep3_spec = P(batch_pspec_axis, None, None)
+-    ep2_spec = P(batch_pspec_axis, None)
+     out_partition_spec = (batch_pspec_axis, None, None)
+
+@@ -872,15 +934,12 @@ def _moe_bwd_rule(
+
+     # ---------------- FFN bwd (per-shard via shard_map) ----------------
+-    kernel_spec = P(ep_axis, None, None)
+-    bias_spec = P(ep_axis, None) if has_bias else None
+-
+     bwd_in_specs = (
+         ep3_spec,  # d_expert_outputs
+         P(),  # casted_sorted_x_lhs_trans
+-        P(ep_axis, None, None),  # casted_wi_rhs_trans
++        kernel_spec,  # casted_wi_rhs_trans
+         P(),  # gate_proj_out
+         P(),  # up_proj_out
+         P(),  # casted_intermediate_lhs_trans
+-        P(ep_axis, None, None),  # casted_wo_rhs_trans
++        kernel_spec,  # casted_wo_rhs_trans
+         ep2_spec,  # local_group_sizes (1, num_local_experts) per shard
+         ep2_spec,  # recv_topk_weights
+@@ -926,5 +985,6 @@ def _moe_bwd_rule(
+         # Weight grads accumulate per-DP-shard inside the body; psum across
+         # DP axes so each replica sees the full sum (matches out_specs
+-        # P(ep_axis, ...) which is DP-replicated).
++        # P(ep_axes, ...) which is outer-DP-replicated). Compound EP axes are
++        # excluded by _normalize_moe_mesh_axes and are never reduced here.
+         if data_parallelism_axes:
+             dp = tuple(data_parallelism_axes)
+@@ -1153,5 +1213,5 @@ def moe(
+     aux_loss_coeff: float = 0.0,
+     apply_topk_weights_early: bool = False,
+-    ep_axis: str,
++    ep_axis: Union[str, Tuple[str, ...]],
+     data_parallelism_axes: Tuple[str, ...] = (),
+     input_axes: Tuple[Optional[str], ...] = (),
+@@ -1189,10 +1249,12 @@ def moe(
+     Axis-name parameters:
+
+-    * ``ep_axis`` and ``data_parallelism_axes`` are *physical mesh
+-      axis names* -- they index ``jax.sharding.Mesh.shape`` directly
++    * ``ep_axis`` is one physical mesh axis name or a flat tuple of names;
++      ``data_parallelism_axes`` contains true outer-DP physical axes. They
++      index ``jax.sharding.Mesh.shape`` directly
+       (to compute ``num_ep`` / ``dp_size`` and to construct
+-      ``P((dp..., ep), None, None)`` for the per-shard
++      ``P((dp..., ep...), None, None)`` for the per-shard
+       ``jax.lax.with_sharding_constraint`` calls that JAX requires
+-      to refer to real mesh axes).
++      to refer to real mesh axes). The two groups must be duplicate-free
++      and disjoint.
+     * ``input_axes``, ``gate_kernel_axes``, ``wi_kernel_axes``,
+       ``wo_kernel_axes`` are *logical axis names* (e.g.
+@@ -1217,13 +1279,23 @@ def moe(
+     score_function = _validate_score_function(score_function)
+
+-    # Enforce ((outer_dp..., ep), None, None) on inbound activations. The
+-    # EP comm groups consecutive global ranks (dp_color = rank // ep_size),
+-    # so ep MUST be innermost in the partition spec. Soft re-pin: free if
+-    # upstream already matches, single reshard otherwise.
++    # Enforce ((outer_dp..., ep...), None, None) on inbound activations.
++    # Compound EP axes are flattened after true outer DP axes. Soft re-pin:
++    # free if upstream already matches, single reshard otherwise.
+     mesh = _get_mesh()
+     if mesh is None or mesh.empty:
+         raise ValueError("moe(...) requires an active jax.sharding.Mesh.")
+-    expected_leading: Any = (*data_parallelism_axes, ep_axis) if data_parallelism_axes else ep_axis
+-    expected_spec = P(expected_leading, None, None)
++    (
++        ep_axes,
++        data_parallelism_axes,
++        _expected_leading,
++        expected_spec,
++        _ep2_spec,
++        _kernel_spec,
++        _bias_spec,
++    ) = _moe_partition_specs(ep_axis, data_parallelism_axes)
++    # Validate concrete mesh membership and compute both resource products at
++    # the public boundary before tracing the custom_vjp.
++    _mesh_axes_size(mesh, ep_axes, "EP")
++    _mesh_axes_size(mesh, data_parallelism_axes, "data-parallel")
+     actual_spec = getattr(getattr(x, "sharding", None), "spec", None)
+     if actual_spec is not None and tuple(actual_spec) != tuple(expected_spec):
+@@ -1264,5 +1336,5 @@ def moe(
+         scaling_factor,
+         float(aux_loss_coeff),
+-        ep_axis,
++        ep_axes,
+         data_parallelism_axes,
+         input_axes,
+diff --git a/transformer_engine/jax/sharding.py b/transformer_engine/jax/sharding.py
+index 2e8e611f..d97faef9 100644
+--- a/transformer_engine/jax/sharding.py
++++ b/transformer_engine/jax/sharding.py
+@@ -47,7 +47,16 @@ def _get_mesh():
+
+
+-def _get_mesh_info(resource: str, mesh: jax.sharding.Mesh):
+-    assert resource in mesh.axis_names, f"{resource} is not in the axis_names of Mesh {mesh}."
+-    return mesh.shape[resource], resource
++def _normalize_mesh_axes(axis):
++    """Normalize one or more physical mesh axes to a tuple."""
++    if axis is None:
++        return ()
++    return (axis,) if isinstance(axis, str) else tuple(axis)
++
++
++def _get_mesh_info(resource, mesh: jax.sharding.Mesh):
++    axes = _normalize_mesh_axes(resource)
++    missing = tuple(axis for axis in axes if axis not in mesh.axis_names)
++    assert not missing, f"{missing} are not in the axis_names of Mesh {mesh}."
++    return int(np.prod([mesh.shape[axis] for axis in axes])), resource
+
+
+@@ -278,6 +287,8 @@ def get_mesh_axis_size(axis, mesh=None):
+         return 1
+
+-    assert axis in mesh.shape, f"{axis} is not a axis of the given mesh {mesh.shape}"
+-    return mesh.shape[axis]
++    axes = _normalize_mesh_axes(axis)
++    missing = tuple(name for name in axes if name not in mesh.shape)
++    assert not missing, f"{missing} are not axes of the given mesh {mesh.shape}"
++    return int(np.prod([mesh.shape[name] for name in axes]))
+
+
+@@ -332,10 +343,8 @@ class MeshResource:
+         pp_resource: Axis name for pipeline parallelism (layer sharding), default is None
+         cp_resource: Axis name for context parallelism (sequence sharding), default is None
+-        ep_resource: Axis name for expert parallelism. Dispatch input tokens
+-            must be sharded on their leading dim by ``ep_resource`` (alone or
+-            compound with ``dp_resource`` / ``fsdp_resource`` as outer, e.g.
+-            ``PartitionSpec(("dp", "ep"), None, None)``). Dispatch output
+-            ``[ep_size, recv_capacity, H]`` is always sharded by ``ep_resource``
+-            on the leading ``ep_size`` dim.
++        ep_resource: Axis name or tuple of axis names for expert parallelism.
++            All EP axes shard the leading dimension. DP/FSDP resources not
++            consumed by EP may additionally shard that dimension as outer
++            token groups.
+     """
+
+@@ -346,5 +355,5 @@ class MeshResource:
+     pp_resource: str = None
+     cp_resource: str = None
+-    ep_resource: str = None
++    ep_resource: str | tuple[str, ...] = None
+
+
+@@ -386,5 +395,5 @@ def global_mesh_resource() -> MeshResource:
+
+
+-def get_active_resource_axis(resource_name: str) -> Optional[str]:
++def get_active_resource_axis(resource_name: str) -> Optional[str | tuple[str, ...]]:
+     """Resolve a :class:`MeshResource` attribute to its mesh axis name,
+     or return ``None`` if that resource is not active.

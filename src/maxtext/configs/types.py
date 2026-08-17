@@ -756,6 +756,13 @@ class MoEGeneral(BaseModel):
           "1 keeps complete expert weights and folds dense TP into the expert-data-parallel view."
       ),
   )
+  te_ep_compound_tensor_expert: bool = Field(
+      False,
+      description=(
+          "Form one TE EP resource from the physical tensor and expert mesh axes. "
+          "Dense layers retain normal TP; MoE uses ETP1 with compound EP."
+      ),
+  )
   hybrid_ep_pad_multiple: int = Field(
       128,
       description="Padding alignment for hybridEP expert GEMMs. DeepEP pads each expert's tokens to this multiple. Must be 128 for te_mxfp8.",
@@ -2354,6 +2361,15 @@ class MaxTextConfig(
       else:
         raise NotImplementedError(f"Custom mesh config file not found at {custom_mesh_path}")
 
+    if self.te_ep_compound_tensor_expert:
+      if not self.use_te_ep:
+        raise ValueError("te_ep_compound_tensor_expert=True requires use_te_ep=True.")
+      if self.te_ep_expert_tensor_parallelism != 1:
+        raise ValueError(
+            "te_ep_compound_tensor_expert=True requires "
+            "te_ep_expert_tensor_parallelism=1."
+        )
+
     if self.use_te_ep and self.te_ep_expert_tensor_parallelism == 1:
       # Megatron-style ETP1 keeps H replicated at the MoE boundary and uses the
       # dense tensor axis as sequence parallelism.  The TE EP mesh later folds
@@ -2366,6 +2382,8 @@ class MaxTextConfig(
           "activation_mlp_moe": [],
           "norm": ["tensor_transpose"],
       }
+      if self.te_ep_compound_tensor_expert:
+        etp1_rule_overrides["exp"] = ["tensor", "expert"]
       self.logical_axis_rules = [
           (logical_axis, etp1_rule_overrides.get(logical_axis, mesh_axes))
           for logical_axis, mesh_axes in self.logical_axis_rules
@@ -2868,16 +2886,19 @@ class MaxTextConfig(
         # The mesh-level "expert" axis composes ICI × DCN EP into a single dimension,
         # so the te_ep_init bootstrap sees the combined ep_size automatically. Whether
         # TE EP's NCCL transport actually supports cross-node EP is container-dependent.
-        if self.ici_expert_parallelism < 4:
-          raise ValueError("use_te_ep=True requires ici_expert_parallelism >= 4 for v1.")
-        if self.num_experts % self.ici_expert_parallelism != 0:
+        if not self.te_ep_compound_tensor_expert:
+          if self.ici_expert_parallelism < 4:
+            raise ValueError("use_te_ep=True requires ici_expert_parallelism >= 4 for v1.")
+          if self.num_experts % self.ici_expert_parallelism != 0:
+            raise ValueError(
+                "use_te_ep=True requires num_experts to be divisible by ici_expert_parallelism. "
+                f"Got num_experts={self.num_experts}, ici_expert_parallelism={self.ici_expert_parallelism}."
+            )
+        allowed_ici_tensor = (1, 2, 4, 8) if self.te_ep_compound_tensor_expert else (1, 2)
+        if self.ici_tensor_parallelism not in allowed_ici_tensor:
           raise ValueError(
-              "use_te_ep=True requires num_experts to be divisible by ici_expert_parallelism. "
-              f"Got num_experts={self.num_experts}, ici_expert_parallelism={self.ici_expert_parallelism}."
-          )
-        if self.ici_tensor_parallelism not in (1, 2):
-          raise ValueError(
-              "use_te_ep=True currently supports only ici_tensor_parallelism 1 or 2 for v1; "
+              "use_te_ep=True supports ICI tensor powers 1 or 2 normally, and "
+              "1, 2, 4, or 8 in compound tensor×expert mode; "
               f"got ici_tensor_parallelism={self.ici_tensor_parallelism}."
           )
         if self.te_ep_expert_tensor_parallelism not in (0, 1):
@@ -2886,6 +2907,24 @@ class MaxTextConfig(
               "(inherit dense TP) or 1 (complete experts); "
               f"got {self.te_ep_expert_tensor_parallelism}."
           )
+        if self.te_ep_compound_tensor_expert:
+          if self.dcn_tensor_parallelism != 1:
+            raise ValueError(
+                "te_ep_compound_tensor_expert=True rejects DCN tensor parallelism; "
+                "the tensor part of compound EP must be ICI-only."
+            )
+          compound_ep_size = (
+              self.ici_tensor_parallelism
+              * self.ici_expert_parallelism
+              * self.dcn_expert_parallelism
+          )
+          if compound_ep_size <= 1:
+            raise ValueError("te_ep_compound_tensor_expert=True requires compound EP size > 1.")
+          if self.num_experts % compound_ep_size != 0:
+            raise ValueError(
+                "te_ep_compound_tensor_expert=True requires num_experts divisible by "
+                f"tensor_size*expert_size ({compound_ep_size}); got num_experts={self.num_experts}."
+            )
         unsupported_tensor_parallel_axes = {
             "dcn_tensor_parallelism": self.dcn_tensor_parallelism,
             "ici_tensor_transpose_parallelism": self.ici_tensor_transpose_parallelism,

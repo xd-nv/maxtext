@@ -134,6 +134,17 @@ class TestEtp1ParameterShardingRequirements(unittest.TestCase):
         {"expert", "fsdp"},
     )
 
+  def test_compound_ep_with_fsdp_requires_every_storage_axis(self):
+    path = "['params']['decoder']['moe_layers']['MoeBlock_0']['wo']"
+    self.assertEqual(
+        te_ep_etp1_required_mesh_axes(
+            path,
+            compound_tensor_expert=True,
+            require_fsdp=True,
+        ),
+        {"tensor", "expert", "fsdp"},
+    )
+
   def test_attention_parameter_uses_default_requirements(self):
     path = "['params']['decoder']['moe_layers']['self_attention']['wq_a']['kernel']"
     self.assertIsNone(te_ep_etp1_required_mesh_axes(path))

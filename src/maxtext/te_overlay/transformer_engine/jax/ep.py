@@ -41,6 +41,12 @@ __all__ = [
 _atexit_registered = False
 
 
+def _normalize_axes(axes):
+    if axes is None:
+        return ()
+    return (axes,) if isinstance(axes, str) else tuple(axes)
+
+
 def _allgather_uid(uid_arr, world_size, uid_size):
     """Allgather UID bytes across all processes.
 
@@ -86,11 +92,21 @@ def _ep_domain_for_rank(mesh, ep_resource, rank, device_to_rank=None):
         def device_to_rank(d):
             return d.process_index
 
-    ep_pos = mesh.axis_names.index(ep_resource)
-    ep_size = mesh.shape[ep_resource]
+    ep_axes = _normalize_axes(ep_resource)
+    if not ep_axes or len(set(ep_axes)) != len(ep_axes):
+        raise ValueError(f"ep_bootstrap: invalid ep_resource={ep_resource!r}.")
+    missing = tuple(axis for axis in ep_axes if axis not in mesh.axis_names)
+    if missing:
+        raise ValueError(
+            f"ep_bootstrap: EP axes {missing} are absent from mesh axes {mesh.axis_names}."
+        )
+    non_ep_axes = tuple(axis for axis in mesh.axis_names if axis not in ep_axes)
+    transpose_axes = tuple(mesh.axis_names.index(axis) for axis in (*non_ep_axes, *ep_axes))
+    ep_size = int(np.prod([mesh.shape[axis] for axis in ep_axes]))
     ranks = np.vectorize(device_to_rank, otypes=[np.int64])(mesh.devices)
-    # Move ep last and flatten: each row is one domain (all non-ep coords fixed).
-    grid = np.moveaxis(ranks, ep_pos, -1).reshape(-1, ep_size)
+    # Flatten every EP axis into one communicator dimension. Each row fixes all
+    # non-EP coordinates and follows ep_resource tuple order within the domain.
+    grid = np.transpose(ranks, transpose_axes).reshape(-1, ep_size)
     loc = np.argwhere(grid == rank)
     if loc.shape[0] != 1:
         raise ValueError(
@@ -102,12 +118,14 @@ def _ep_domain_for_rank(mesh, ep_resource, rank, device_to_rank=None):
 
 
 def _num_ep_output_groups(mesh_resource, axis_size_fn=get_mesh_axis_size):
-    """Count distinct EP output slabs from DP/FSDP resources, excluding TP."""
+    """Count outer DP/FSDP output slabs not consumed by compound EP."""
+    ep_axes = set(_normalize_axes(getattr(mesh_resource, "ep_resource", None)))
     distinct_token_axes = tuple(
         dict.fromkeys(
             axis
-            for axis in (mesh_resource.dp_resource, mesh_resource.fsdp_resource)
-            if axis is not None
+            for resource in (mesh_resource.dp_resource, mesh_resource.fsdp_resource)
+            for axis in _normalize_axes(resource)
+            if axis not in ep_axes
         )
     )
     num_groups = 1
@@ -274,8 +292,8 @@ def _default_out_partition_spec():
         raise ValueError(
             "ep_resource is not set on the active MeshResource; pass out_sharding=... explicitly."
         )
-    outer = _ep_outer_axis()
-    leading = (outer, gsr.ep_resource) if outer is not None else gsr.ep_resource
+    leading_axes = (*_normalize_axes(_ep_outer_axis()), *_normalize_axes(gsr.ep_resource))
+    leading = leading_axes[0] if len(leading_axes) == 1 else leading_axes
     return (leading,)
 
 

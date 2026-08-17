@@ -52,6 +52,7 @@ from maxtext.utils import max_logging
 
 
 _TE_EP_AXIS = "expert"
+_TE_EP_COMPOUND_AXES = ("tensor", "expert")
 _TE_EP_STATE: "TeEpState | None" = None
 
 
@@ -61,7 +62,9 @@ class TeEpState:
 
   mesh: Any
   mesh_resource: Any
-  ep_axis: str
+  ep_axis: str | tuple[str, ...]
+  ep_axes: tuple[str, ...]
+  uses_compound_ep: bool
   outer_axes: tuple[str, ...]
   outer_size: int
   ep_size: int
@@ -99,23 +102,39 @@ class TeEpState:
     return self.outer_axes
 
 
-def _mesh_axis_size(mesh: jax.sharding.Mesh, axis: str) -> int:
-  if axis not in mesh.shape:
+def _mesh_axis_size(mesh: jax.sharding.Mesh, axis: str | tuple[str, ...]) -> int:
+  axes = (axis,) if isinstance(axis, str) else tuple(axis)
+  missing = tuple(name for name in axes if name not in mesh.shape)
+  if missing:
     raise ValueError(
-        f"TE EP requires mesh axis '{axis}'. Available axes: {tuple(mesh.shape.keys())}."
+        f"TE EP requires mesh axes {missing}. Available axes: {tuple(mesh.shape.keys())}."
     )
-  return int(mesh.shape[axis])
+  return math.prod(int(mesh.shape[name]) for name in axes)
 
 
 def _active_mesh_axes(mesh: jax.sharding.Mesh) -> dict[str, int]:
   return {axis: int(size) for axis, size in mesh.shape.items() if int(size) > 1}
 
 
-def select_te_ep_outer_axis(mesh: jax.sharding.Mesh) -> str | None:
-  """Pick the single non-EP outer mesh axis for TE EP v1.
+def _normalize_axes(axes: str | tuple[str, ...] | None) -> tuple[str, ...]:
+  if axes is None:
+    return ()
+  return (axes,) if isinstance(axes, str) else tuple(axes)
 
-  Preference order: ``fsdp`` > ``data``. Returns ``None`` when neither is
-  present in the mesh (pure-EP, no DP/FSDP).
+
+def te_ep_expert_partition_axis(config: Any) -> str | tuple[str, ...]:
+  """Physical axis resource that partitions complete expert parameters."""
+  if bool(getattr(config, "te_ep_compound_tensor_expert", False)):
+    return _TE_EP_COMPOUND_AXES
+  return _TE_EP_AXIS
+
+
+def select_te_ep_outer_axis(mesh: jax.sharding.Mesh) -> str | None:
+  """Compatibility selector for callers that can represent only one outer axis.
+
+  New TE EP state construction uses :func:`select_te_ep_outer_axes` and supports
+  active ``data`` and ``fsdp`` together. This helper preserves the historical
+  preference ``fsdp`` > ``data`` for older callers.
   """
   if "fsdp" in mesh.shape:
     return "fsdp"
@@ -124,25 +143,34 @@ def select_te_ep_outer_axis(mesh: jax.sharding.Mesh) -> str | None:
   return None
 
 
-def _validate_v1_mesh(mesh: jax.sharding.Mesh, outer_axis: str | None, tensor_axis: str | None) -> None:
-  """v1 supports EP, optional ICI TP, and one DP/FSDP outer axis being active."""
+def select_te_ep_outer_axes(mesh: jax.sharding.Mesh) -> tuple[str, ...]:
+  """Return active data/FSDP axes in deterministic operand-leading order."""
+  return tuple(axis for axis in ("data", "fsdp") if int(mesh.shape.get(axis, 1)) > 1)
+
+
+def _validate_v1_mesh(
+    mesh: jax.sharding.Mesh,
+    outer_axes: tuple[str, ...],
+    tensor_axis: str | None,
+    ep_axes: tuple[str, ...] = (_TE_EP_AXIS,),
+) -> None:
+  """Validate EP, optional ICI TP, and any active data/FSDP outer axes."""
   active_axes = _active_mesh_axes(mesh)
-  allowed = {_TE_EP_AXIS}
-  if outer_axis is not None:
-    allowed.add(outer_axis)
+  allowed = set(ep_axes)
+  allowed.update(outer_axes)
   if tensor_axis is not None:
     allowed.add(tensor_axis)
   unsupported = {axis: size for axis, size in active_axes.items() if axis not in allowed}
   if unsupported:
     raise ValueError(
         "use_te_ep=True v1 supports only the expert axis, optional ICI tensor axis, "
-        "and one outer data/FSDP axis. "
+        "and outer data/FSDP axes. "
         f"Unsupported active mesh axes: {unsupported}."
     )
 
 
 def _build_mesh_resource(
-    outer_axes: tuple[str, ...], ep_axis: str, tensor_axis: str | None
+    outer_axes: tuple[str, ...], ep_axis: str | tuple[str, ...], tensor_axis: str | None
 ) -> Any:
   """Build a MeshResource for TE EP bootstrap.
 
@@ -279,31 +307,49 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   """
   dense_tensor_size = int(mesh.shape.get("tensor", 1))
   requested_etp = int(getattr(config, "te_ep_expert_tensor_parallelism", 0))
+  uses_compound_ep = bool(getattr(config, "te_ep_compound_tensor_expert", False))
   if requested_etp not in (0, 1):
     raise ValueError(
         "te_ep_expert_tensor_parallelism must be 0 (inherit dense TP) or 1; "
         f"got {requested_etp}."
     )
 
-  dense_outer_axis = select_te_ep_outer_axis(mesh)
+  dense_outer_axes = select_te_ep_outer_axes(mesh)
   dense_tensor_axis = "tensor" if dense_tensor_size > 1 else None
-  _validate_v1_mesh(mesh, dense_outer_axis, dense_tensor_axis)
 
   uses_etp1_view = requested_etp == 1
+  if uses_compound_ep and not uses_etp1_view:
+    raise ValueError(
+        "te_ep_compound_tensor_expert=True requires "
+        "te_ep_expert_tensor_parallelism=1."
+    )
+  ep_axes = _TE_EP_COMPOUND_AXES if uses_compound_ep else (_TE_EP_AXIS,)
+  ep_axis: str | tuple[str, ...] = ep_axes if uses_compound_ep else _TE_EP_AXIS
+  _validate_v1_mesh(
+      mesh,
+      dense_outer_axes,
+      None if uses_compound_ep else dense_tensor_axis,
+      ep_axes,
+  )
   te_mesh = mesh
-  ep_size = _mesh_axis_size(mesh, _TE_EP_AXIS)
-  if uses_etp1_view:
+  ep_size = _mesh_axis_size(mesh, ep_axis)
+  if uses_compound_ep:
+    outer_axes = dense_outer_axes
+    outer_size = math.prod(_mesh_axis_size(mesh, axis) for axis in outer_axes)
+    tensor_axis = None
+    tensor_size = 1
+  elif uses_etp1_view:
     outer_axes = tuple(
         axis
-        for axis in (dense_tensor_axis, dense_outer_axis)
+        for axis in (dense_tensor_axis, *dense_outer_axes)
         if axis is not None and _mesh_axis_size(mesh, axis) > 1
     )
     outer_size = math.prod(_mesh_axis_size(mesh, axis) for axis in outer_axes)
     tensor_axis = None
     tensor_size = 1
   else:
-    outer_axes = (dense_outer_axis,) if dense_outer_axis is not None else ()
-    outer_size = _mesh_axis_size(mesh, dense_outer_axis) if dense_outer_axis is not None else 1
+    outer_axes = dense_outer_axes
+    outer_size = math.prod(_mesh_axis_size(mesh, axis) for axis in outer_axes)
     tensor_axis = dense_tensor_axis
     tensor_size = dense_tensor_size
 
@@ -380,11 +426,12 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
 
   num_moe_layers = int(config.num_decoder_layers) - int(config.first_num_dense_layers)
 
-  leading_axes = (*outer_axes, _TE_EP_AXIS)
+  leading_axes = (*outer_axes, *ep_axes)
   leading_spec: Any = leading_axes[0] if len(leading_axes) == 1 else leading_axes
   hidden_spec: Any = tensor_axis
   config_key = (
-      _TE_EP_AXIS,
+      ep_axis,
+      uses_compound_ep,
       outer_axes,
       outer_size,
       ep_size,
@@ -409,8 +456,10 @@ def build_te_ep_state(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
 
   return TeEpState(
       mesh=te_mesh,
-      mesh_resource=_build_mesh_resource(outer_axes, _TE_EP_AXIS, tensor_axis),
-      ep_axis=_TE_EP_AXIS,
+      mesh_resource=_build_mesh_resource(outer_axes, ep_axis, tensor_axis),
+      ep_axis=ep_axis,
+      ep_axes=ep_axes,
+      uses_compound_ep=uses_compound_ep,
       outer_axes=outer_axes,
       outer_size=outer_size,
       ep_size=ep_size,
@@ -511,7 +560,8 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   _TE_EP_STATE = candidate
   max_logging.log(
       "TE EP bootstrapped: "
-      f"outer_axes={candidate.outer_axes}, ep_axis={candidate.ep_axis}, "
+      f"outer_axes={candidate.outer_axes}, ep_axes={candidate.ep_axes}, "
+      f"compound={candidate.uses_compound_ep}, "
       f"ep_size={candidate.ep_size}, outer_size={candidate.outer_size}, "
       f"tensor_axis={candidate.tensor_axis}, expert_tensor_size={candidate.tensor_size}, "
       f"dense_tensor_size={candidate.dense_tensor_size}, etp1_view={candidate.uses_etp1_view}, "

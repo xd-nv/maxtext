@@ -158,6 +158,18 @@ def get_te_ep_etp1_kernel_axes(mesh):
   return ("exp", None, None), ("exp", None, None)
 
 
+def get_te_ep_etp1_bias_axes(mesh):
+  """Return ETP1 bias axes, retaining optional FSDP-at-rest sharding."""
+  return ("exp", "embed_moe") if int(mesh.shape.get("fsdp", 1)) > 1 else ("exp", None)
+
+
+def _te_ep_expert_partition_axis(config):
+  """Physical EP resource used by complete expert weights at execution."""
+  from maxtext.layers.te_ep_init import te_ep_expert_partition_axis  # pylint: disable=import-outside-toplevel
+
+  return te_ep_expert_partition_axis(config)
+
+
 def random_routing(rng_key, gate_logits, num_experts_per_tok):
   """Performs random routing of tokens to experts.
 
@@ -545,8 +557,12 @@ class RoutedMoE(nnx.Module):
       )
 
     if self.config.mlp_bias:
-      wi_bias_axes = ("exp", "activation_mlp")
-      wo_bias_axes = ("exp", "activation_embed")
+      if self.config.use_te_ep and self.config.te_ep_expert_tensor_parallelism == 1:
+        wi_bias_axes = get_te_ep_etp1_bias_axes(self.mesh)
+        wo_bias_axes = get_te_ep_etp1_bias_axes(self.mesh)
+      else:
+        wi_bias_axes = ("exp", "activation_mlp")
+        wo_bias_axes = ("exp", "activation_embed")
       wi_bias_shape = (self.num_experts, self.intermediate_dim)
       wo_bias_shape = (self.num_experts, self.moe_expert_input_dim)
       self.wi_0_bias = nnx.Param(
@@ -1662,12 +1678,13 @@ class RoutedMoE(nnx.Module):
       w1_pspec = self._logical_to_mesh_axes(("exp", "embed_tensor_transpose", "mlp_no_fsdp"))
       wo_pspec = self._logical_to_mesh_axes(("exp", "mlp_no_fsdp", "embed_tensor_transpose"))
     if self.config.use_te_ep and self.config.te_ep_expert_tensor_parallelism == 1:
-      w0_pspec = P("expert", None, None)
-      w1_pspec = P("expert", None, None)
-      wo_pspec = P("expert", None, None)
-      w0_bias_pspec = P("expert", None)
-      w1_bias_pspec = P("expert", None)
-      wo_bias_pspec = P("expert", None)
+      expert_axis = _te_ep_expert_partition_axis(self.config)
+      w0_pspec = P(expert_axis, None, None)
+      w1_pspec = P(expert_axis, None, None)
+      wo_pspec = P(expert_axis, None, None)
+      w0_bias_pspec = P(expert_axis, None)
+      w1_bias_pspec = P(expert_axis, None)
+      wo_bias_pspec = P(expert_axis, None)
       weight_gather = False
     if isinstance(w0_kernel, aqt.QTensor):
       w0_pspec = aqt.partition_spec(w0_pspec, (1,), w0_kernel.dtype, use_bias=False)

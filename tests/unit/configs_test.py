@@ -129,6 +129,71 @@ def test_base_configs(config_file):
   run_config_validation(config_file)
 
 
+def _compound_te_ep_config(*, expert_size=2, tensor_size=8, **overrides):
+  config_dict = deepcopy(
+      load_and_merge_yamls(os.path.join(CONFIGS_DIR, "models", "deepseek3-671b.yml"))
+  )
+  config_dict.pop("base_config", None)
+  config_dict.update(
+      {
+          "hardware": "gpu",
+          "use_te_ep": True,
+          "sparse_matmul": True,
+          "te_ep_expert_tensor_parallelism": 1,
+          "te_ep_compound_tensor_expert": True,
+          "ici_tensor_parallelism": tensor_size,
+          "dcn_tensor_parallelism": 1,
+          "ici_expert_parallelism": 1,
+          "dcn_expert_parallelism": expert_size,
+          "ici_fsdp_parallelism": 1,
+          "dcn_fsdp_parallelism": 1,
+          "ici_data_parallelism": 1,
+          "dcn_data_parallelism": 1,
+          "num_slices": expert_size,
+      }
+  )
+  config_dict.update(overrides)
+  return pydantic_types.MaxTextConfig(**config_dict)
+
+
+@pytest.mark.parametrize("expert_size", [2, 4, 8])
+def test_compound_te_ep_primary_topologies(expert_size):
+  config = _compound_te_ep_config(expert_size=expert_size)
+  assert config.ici_tensor_parallelism == 8
+  assert config.dcn_expert_parallelism == expert_size
+  assert config.num_experts % (8 * expert_size) == 0
+  assert dict(config.logical_axis_rules)["exp"] == ["tensor", "expert"]
+
+
+def test_compound_te_ep_supports_outer_fsdp():
+  config = _compound_te_ep_config(
+      expert_size=1,
+      tensor_size=4,
+      ici_expert_parallelism=4,
+      dcn_expert_parallelism=1,
+      ici_fsdp_parallelism=2,
+      num_slices=1,
+  )
+  assert config.ici_tensor_parallelism == 4
+  assert config.ici_expert_parallelism == 4
+  assert config.ici_fsdp_parallelism == 2
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"use_te_ep": False}, "requires use_te_ep"),
+        ({"te_ep_expert_tensor_parallelism": 0}, "requires te_ep_expert_tensor_parallelism=1"),
+        ({"dcn_tensor_parallelism": 2}, "rejects DCN tensor"),
+        ({"ici_tensor_parallelism": 3}, "supports ICI tensor powers"),
+        ({"num_experts": 48, "dcn_expert_parallelism": 8}, "num_experts divisible"),
+    ],
+)
+def test_compound_te_ep_rejects_invalid_configs(overrides, message):
+  with pytest.raises(ValueError, match=message):
+    _compound_te_ep_config(**overrides)
+
+
 # --- Test Group 2: Gemma Model Family ---
 
 GEMMA_CONFIGS = [

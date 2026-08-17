@@ -43,7 +43,12 @@ def create_training_optimizer(config, model):
   return learning_rate_schedule, tx
 
 
-def te_ep_etp1_required_mesh_axes(param_name: str, *, require_fsdp: bool = False) -> set[str] | None:
+def te_ep_etp1_required_mesh_axes(
+    param_name: str,
+    *,
+    compound_tensor_expert: bool = False,
+    require_fsdp: bool = False,
+) -> set[str] | None:
   """Return the required mesh axes for an ETP1 routed-expert parameter."""
   routed_expert_params = ("wi", "wi_0", "wi_1", "wo", "wi_0_bias", "wi_1_bias", "wo_bias")
   if "MoeBlock_" not in param_name:
@@ -52,7 +57,7 @@ def te_ep_etp1_required_mesh_axes(param_name: str, *, require_fsdp: bool = False
     # ETP1 GEMMs consume complete experts, but an active FSDP axis stores the
     # expert parameters sharded at rest and gathers them at the shard_map
     # boundary. Dense TP remains expert-data parallelism, not weight sharding.
-    required_axes = {"expert"}
+    required_axes = {"tensor", "expert"} if compound_tensor_expert else {"expert"}
     if require_fsdp:
       required_axes.add("fsdp")
     return required_axes
@@ -290,6 +295,7 @@ def setup_train_loop(config, recorder, devices=None):
       if bool(config.use_te_ep) and int(config.te_ep_expert_tensor_parallelism) == 1:
         required_mesh_axes_by_path = functools.partial(
             te_ep_etp1_required_mesh_axes,
+            compound_tensor_expert=bool(config.te_ep_compound_tensor_expert),
             require_fsdp=int(mesh.shape.get("fsdp", 1)) > 1,
         )
       sharding.assert_params_sufficiently_sharded(
