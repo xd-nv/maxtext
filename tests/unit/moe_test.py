@@ -879,13 +879,15 @@ class RoutedMoeTest(unittest.TestCase):
       ]
 
       # Get the actual local_permute outputs.
-      sorted_inputs, sorted_indices, local_group_size, sorted_experts_ids = moe.RoutedMoE.local_permute(
-          inputs_shard,
-          global_group_sizes[None, :],
-          experts_per_shard,
-          shard_index,
-          use_custom_sort_vjp=False,
-          is_offset=False,
+      sorted_inputs, sorted_indices, local_group_size, sorted_experts_ids = (
+          moe.RoutedMoE._mt_local_permute(
+              inputs_shard,
+              global_group_sizes[None, :],
+              experts_per_shard,
+              shard_index,
+              use_custom_sort_vjp=False,
+              is_offset=False,
+          )
       )
 
       # Calculate expected outputs for the current shard
@@ -941,14 +943,16 @@ class RoutedMoeTest(unittest.TestCase):
         input_offsets = jnp.concatenate((jnp.array([0]), jnp.cumsum(local_group_sizes)[:-1]))
 
         # Actual results of local_permute().
-        permuted_x, local_sorted_indices, local_expert_counts, local_expert_assignments = moe.RoutedMoE.local_permute(
-            x,
-            global_expert_counts[None, :],
-            experts_per_group,
-            shard_index=shard_id,
-            use_custom_sort_vjp=False,
-            is_offset=True,
-            global_sorted_experts=expert_assignments,
+        permuted_x, local_sorted_indices, local_expert_counts, local_expert_assignments = (
+            moe.RoutedMoE._mt_local_permute(
+                x,
+                global_expert_counts[None, :],
+                experts_per_group,
+                shard_index=shard_id,
+                use_custom_sort_vjp=False,
+                is_offset=True,
+                global_sorted_experts=expert_assignments,
+            )
         )
 
         # permuted_x should be equivalent to slicing x at the input offset for that shard.

@@ -1399,7 +1399,17 @@ class RoutedMoE(nnx.Module):
     return tuple(bias[experts_index] for bias in biases)
 
   @staticmethod
-  def get_ragged_buffer_size(local_batch, ep_degree, global_experts, top_k, ragged_buffer_factor):
+  def get_ragged_buffer_size(
+      local_batch,
+      ep_degree,
+      global_experts,
+      top_k,
+      ragged_buffer_factor,
+      *,
+      te_use_gmm=False,
+      te_router_and_permutation_impl=False,
+      align_size=0,
+  ):
     """Calculates the token batch size of the ragged buffer.
     When explicitly setting ragged_buffer_factor>0, this is balanced_size * ragged_buffer_factor, which can drop tokens.
     Otherwise this will be worst case size to ensure no dropping.
@@ -1416,7 +1426,7 @@ class RoutedMoE(nnx.Module):
     """
     balanced_size = local_batch
     if ragged_buffer_factor > 0.0:
-      if self.config.te_use_gmm or self.config.te_router_and_permutation_impl:
+      if te_use_gmm or te_router_and_permutation_impl:
         raise ValueError("ragged_buffer_factor is not supported with TE-based GMM or permutation.")
       # This will drop tokens if the true distribution exceeds this buffer.
       return int(balanced_size * ragged_buffer_factor)
@@ -1441,9 +1451,8 @@ class RoutedMoE(nnx.Module):
       # total token count. We need to ensure the buffer can hold the padded data.
       # Note: Padding is applied in global permute, so this follows global mode.
       # Applied for both TE and MT permutation to support future per-group padding in mt_permute.
-      align_size = self.config.moe_permutation_group_align_size
       if align_size > 0:
-        local_expert_size = self.config.num_experts // ep_degree
+        local_expert_size = global_experts // ep_degree
         # Add headroom for padding: each (shard, expert) chunk can add up to align_size-1 tokens
         # Worst case: every chunk has 1 token, padded to align_size
         # Total padding overhead = ep_degree * local_expert_size * (align_size - 1)
@@ -1834,6 +1843,9 @@ class RoutedMoE(nnx.Module):
                 self.config.num_experts,
                 self.config.num_experts_per_tok,
                 self.config.ragged_buffer_factor,
+                te_use_gmm=self.config.te_use_gmm,
+                te_router_and_permutation_impl=self.config.te_router_and_permutation_impl,
+                align_size=self.config.moe_permutation_group_align_size,
             )
             output_shape = jax.lax.empty((buffer_size, self.moe_expert_input_dim), dtype=x.dtype)
 
