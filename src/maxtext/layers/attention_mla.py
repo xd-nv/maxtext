@@ -1058,6 +1058,7 @@ class MLA(Attention):
       low_rank = inputs  # already the kv_lora_rank+rope_head_dim slice from wq_kv_a split in __call__
     else:
       low_rank = self.wkv_a(inputs, out_sharding=wkva_out_sharding)
+      low_rank = self._maybe_shard_with_logical(low_rank, wka_logical_name)
     low_rank_main, low_rank_rope = jnp.split(low_rank, [self.kv_lora_rank], axis=-1)
     low_rank_main = self.kv_norm(low_rank_main)
     low_rank_main = checkpoint_name(low_rank_main, "mla_kv")
