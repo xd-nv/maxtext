@@ -65,7 +65,7 @@ class TeEpEtp1KernelAxesTest(unittest.TestCase):
     config = SimpleNamespace(te_ep_compound_tensor_expert=True)
     self.assertEqual(
         moe._te_ep_expert_partition_axis(config),
-        ("tensor", "expert"),
+        ("expert", "tensor"),
     )
 
   def test_legacy_execution_specs_keep_expert_only(self):
@@ -88,7 +88,7 @@ class TeEpEtp1KernelAxesTest(unittest.TestCase):
     self.assertEqual(wo_axes, ("exp", None, "embed_moe"))
     self.assertEqual(
         jax.sharding.PartitionSpec(runtime_axis, None, None),
-        jax.sharding.PartitionSpec(("tensor", "expert"), None, None),
+        jax.sharding.PartitionSpec(("expert", "tensor"), None, None),
     )
 
 

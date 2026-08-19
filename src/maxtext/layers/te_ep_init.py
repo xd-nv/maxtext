@@ -52,7 +52,10 @@ from maxtext.utils import max_logging
 
 
 _TE_EP_AXIS = "expert"
-_TE_EP_COMPOUND_AXES = ("tensor", "expert")
+# Keep the node-local ICI tensor axis innermost when TE flattens compound EP
+# resources in C order.  This makes consecutive NCCL EP ranks share an NVLink
+# domain, allowing NCCL to form one LSA team per node instead of one per GPU.
+_TE_EP_COMPOUND_AXES = ("expert", "tensor")
 _TE_EP_STATE: "TeEpState | None" = None
 
 

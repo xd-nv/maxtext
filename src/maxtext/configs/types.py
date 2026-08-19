@@ -2383,7 +2383,9 @@ class MaxTextConfig(
           "norm": ["tensor_transpose"],
       }
       if self.te_ep_compound_tensor_expert:
-        etp1_rule_overrides["exp"] = ["tensor", "expert"]
+        # Match the TE EP communicator order: the final tensor axis varies
+        # fastest, keeping each node's ICI ranks contiguous for NCCL LSA teams.
+        etp1_rule_overrides["exp"] = ["expert", "tensor"]
       self.logical_axis_rules = [
           (logical_axis, etp1_rule_overrides.get(logical_axis, mesh_axes))
           for logical_axis, mesh_axes in self.logical_axis_rules

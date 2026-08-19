@@ -162,7 +162,7 @@ def test_compound_te_ep_primary_topologies(expert_size):
   assert config.ici_tensor_parallelism == 8
   assert config.dcn_expert_parallelism == expert_size
   assert config.num_experts % (8 * expert_size) == 0
-  assert dict(config.logical_axis_rules)["exp"] == ["tensor", "expert"]
+  assert dict(config.logical_axis_rules)["exp"] == ["expert", "tensor"]
 
 
 def test_compound_te_ep_supports_outer_fsdp():

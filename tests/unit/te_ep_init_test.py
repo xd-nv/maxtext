@@ -286,8 +286,8 @@ class BuildTeEpStateTest(unittest.TestCase):
     self.assertEqual(state.expected_world_size, 2 * 16)
     # All 32 ranks own distinct local token shards with complete hidden state.
     self.assertEqual(state.max_tokens_per_rank, 2048)
-    self.assertEqual(state.routing_spec_2d, te_ep_init.PartitionSpec(("tensor", "expert"), None))
-    self.assertEqual(state.input_spec_2d, te_ep_init.PartitionSpec(("tensor", "expert"), None))
+    self.assertEqual(state.routing_spec_2d, te_ep_init.PartitionSpec(("expert", "tensor"), None))
+    self.assertEqual(state.input_spec_2d, te_ep_init.PartitionSpec(("expert", "tensor"), None))
 
   def test_etp1_compounds_tensor_and_fsdp_as_expert_data_outer_axes(self):
     config = self._config()
@@ -332,14 +332,14 @@ class BuildTeEpStateTest(unittest.TestCase):
         mesh = SimpleNamespace(shape={"tensor": 8, "expert": expert_size})
         with patch.object(te_ep_init, "_build_mesh_resource", return_value="resource"):
           state = te_ep_init.build_te_ep_state(config, mesh)
-        self.assertEqual(state.ep_axes, ("tensor", "expert"))
+        self.assertEqual(state.ep_axes, ("expert", "tensor"))
         self.assertTrue(state.uses_compound_ep)
         self.assertEqual(state.ep_size, 8 * expert_size)
         self.assertEqual(state.outer_axes, ())
         self.assertEqual(state.tensor_size, 1)
         self.assertEqual(state.expected_world_size, 8 * expert_size)
         self.assertEqual(state.num_local_experts, 256 // (8 * expert_size))
-        leading = ("tensor", "expert")
+        leading = ("expert", "tensor")
         self.assertEqual(state.routing_spec_2d, te_ep_init.PartitionSpec(leading, None))
         self.assertEqual(state.input_spec_3d, te_ep_init.PartitionSpec(leading, None, None))
 
@@ -350,13 +350,13 @@ class BuildTeEpStateTest(unittest.TestCase):
     mesh = SimpleNamespace(shape={"tensor": 4, "expert": 4, "fsdp": 2})
     with patch.object(te_ep_init, "_build_mesh_resource", return_value="resource") as build_resource:
       state = te_ep_init.build_te_ep_state(config, mesh)
-    build_resource.assert_called_once_with(("fsdp",), ("tensor", "expert"), None)
+    build_resource.assert_called_once_with(("fsdp",), ("expert", "tensor"), None)
     self.assertEqual(state.ep_size, 16)
     self.assertEqual(state.outer_size, 2)
     self.assertEqual(state.expected_world_size, 32)
     self.assertEqual(
         state.input_spec_2d,
-        te_ep_init.PartitionSpec(("fsdp", "tensor", "expert"), None),
+        te_ep_init.PartitionSpec(("fsdp", "expert", "tensor"), None),
     )
 
   def test_compound_requires_etp1(self):
