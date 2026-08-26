@@ -5,6 +5,6 @@ Baseline branch: xiaopo/te-f07-pr3083-compound
 Path                                                     Baseline SHA256                                                   Overlay SHA256
 transformer_engine/jax/ep.py                             8754bbd0b3a97b134d4391e929fab5dcd38f1cba6d1ccc1062c6e45204b7883c  16027773eb6dc0371fb79bebe0316f50e024ba948ea16da9db5081f9d363abf9
 transformer_engine/jax/cpp_extensions/ep.py              bfe7d6334fb510ad137951629fcf7b15d842bfbbf5acbfa58d8cc6f638cd6077  a1f62eef3a0ff9331e5b34adc21bf0e5443f1ee7d814e922ac40d55b17995b5e
-transformer_engine/jax/cpp_extensions/gemm.py            91dd77dc1e2713e0d53f44d200be5eefa29259218fc15dbab6b887981a624deb  28fa97591f727cb29edbf797ee4ae11f1e675f8046ecedb72d1f8f79141af261
+transformer_engine/jax/cpp_extensions/gemm.py            91dd77dc1e2713e0d53f44d200be5eefa29259218fc15dbab6b887981a624deb  d56a16ca8e1dddcb64042ffd6b7d10f3e737b3984cb2b47f694fdd39f65694a1
 transformer_engine/jax/sharding.py                       3641bd5456e044892676c5d4b516b50d09f4a7a16d199b932f7f550c88608520  a826a110e152e9c5c5d91c59cabb93faa8a4327f1669ca464c407725fd26f001
 transformer_engine/jax/moe.py                            d084e4ede487bcccaffb0a951de75ac275540f2b2680a286382dece29a1b9f75  90df241d82a126e4191f03f58cf7140ee80a64dbc7b575399a6a451a425662c0
