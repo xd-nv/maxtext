@@ -955,6 +955,52 @@ target_eval_loss: 0.  # early stop once reaching target eval_loss
 abort_on_nan_loss: True # Check for NaN and abort if found in training loss
 abort_on_inf_loss: True # Check for Inf and abort if found in training loss
 
+# NOTE(jaxpp): begin parameters
+use_jaxpp: False
+schedule: "eager_1f1b"
+fuse_steady_state: False
+
+# Comma-separated list of checkpoint_name() tags to save when remat_policy="named_checkpoint".
+# The named_checkpoint policy also always saves cuDNN flash-attention forward outputs.
+# Set to "" to save only cuDNN flash-attention (no named intermediates).
+#
+# Available names and their cost/benefit (DeepSeek-671B, 8×B200):
+#
+#   Name               | Recompute(µs) | Mem/dev(MB) | Ratio(µs/MB) | Notes
+#   -------------------|---------------|-------------|--------------|------
+#   context            |       ~0      |     128     |    0.00      | dup of cuDNN-saved attn output
+#   decoder_layer_input|      ~14      |      56     |    0.25      | near-free transpose of input
+#   value_proj         |     ~102      |     128     |    0.80      | wkv_b GEMM (shared w/ key_proj)
+#   dispatch_exchanged |     ~840      |     896     |    0.94      | gate+topk+scatter+ragged-a2a
+#   key_proj           |     ~188      |     192     |    0.98      | wkv_b GEMM + RoPE + concat
+#   combine_exchanged  |    ~1419      |     896     |    1.58      | silu·gate + wo GEMM + ragged-a2a
+#   query_proj         |     ~376      |     192     |    1.96      | wq_b GEMM + RoPE + concat
+#   mlpwi_0            |    ~1107      |     256     |    4.32      | expert wi_0 GEMM
+#   mlpwi_1            |    ~1127      |     256     |    4.40      | expert wi_1 GEMM
+#   out_proj           |     ~674      |      56     |   12.04      | attn out_kernel einsum
+#   mla_kv             |      ~36      |       4     |    8.88      | wkv_a GEMM + rms_norm
+#   mla_q              |     ~132      |      12     |   10.98      | wq_a GEMM + rms_norm
+#
+# Lower ratio = cheapest to recompute per MB saved (best candidates to drop).
+named_checkpoint_names: >
+  decoder_layer_input,
+  context,
+  mlpwi,
+  query_proj,
+  key_proj,
+  value_proj,
+  qkv_proj,
+  out_proj,
+  mla_q,
+  mla_kv,
+  dispatch_exchanged,
+  combine_exchanged,
+  mlpwi_0,
+  mlpwi_1,
+  mlpwo,
+
+# NOTE(jaxpp): end parameters
+
 # Goodput parameters
 enable_goodput_recording: False
 monitor_goodput: False

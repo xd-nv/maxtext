@@ -1,4 +1,5 @@
 # Copyright 2023–2025 Google LLC
+# Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,6 +37,193 @@ from maxtext.configs.types import MaxTextConfig
 from maxtext.inference.inference_utils import str2bool
 from maxtext.utils import max_utils
 from maxtext.utils import max_logging
+
+
+from typing import cast
+import numpy as np
+
+def _override_cudnn_flash_attention_abstract_eval() -> None:
+  """Runtime override for cuDNN flash-attention abstract eval sharding."""
+  try:
+    from jax._src import core as jax_core
+    from jax._src.cudnn import fused_attention_stablehlo as fused_attn
+  except ImportError:
+    return
+
+  partition_spec = jax.sharding.PartitionSpec
+
+  def _dot_product_attention_fwd_sharding_rule(query, key, value, layout):
+    for name, aval in [("query", query), ("key", key), ("value", value)]:
+      spec = aval.sharding.spec
+      if layout == fused_attn.AttentionLayout.BNTH.value:
+        _, _, seq_spec, head_spec = spec
+      else:
+        _, seq_spec, _, head_spec = spec
+      if seq_spec is not None:
+        raise jax_core.ShardingTypeError(
+            f"{name} to dot_product_attention must be unsharded on the "
+            f"sequence dimension, but got spec {spec}."
+        )
+      if head_spec is not None:
+        raise jax_core.ShardingTypeError(
+            f"{name} to dot_product_attention must be unsharded on the "
+            f"head dimension, but got spec {spec}."
+        )
+
+    query_spec = query.sharding.spec
+    out_sharding = query.sharding.update(spec=query_spec)
+
+    if layout == fused_attn.AttentionLayout.BNTH.value:
+      batch_spec, head_spec, _, _ = query_spec
+    else:
+      batch_spec, _, head_spec, _ = query_spec
+    stat_sharding = query.sharding.update(
+        spec=partition_spec(batch_spec, head_spec, None)
+    )
+    return out_sharding, stat_sharding
+
+  def _dot_product_attention_bwd_sharding_rule(
+      query, key, value, bias, *, has_dbias, layout
+  ):
+    _dot_product_attention_fwd_sharding_rule(query, key, value, layout)
+    if has_dbias:
+      return query.sharding, key.sharding, value.sharding, bias.sharding
+    return query.sharding, key.sharding, value.sharding
+
+  def _dot_product_attention_fwd_abstract(
+      query,
+      key,
+      value,
+      bias,
+      q_seqlen,
+      kv_seqlen,
+      q_offsets,
+      kv_offsets,
+      page_table_k,
+      page_table_v,
+      *,
+      scale,
+      seed,
+      dropout_rate,
+      variadic_args,
+      mask_type,
+      layout,
+      sliding_window_length,
+      is_training,
+  ):
+    del bias
+    del q_seqlen
+    del kv_seqlen
+    del kv_offsets
+    del page_table_k
+    del page_table_v
+    del scale
+    del seed
+    del dropout_rate
+    del variadic_args
+    del mask_type
+    del sliding_window_length
+
+    if layout == fused_attn.AttentionLayout.BNTH.value:
+      b, n, t, _ = query.shape
+      _, _, _, h = value.shape
+      output_shape = (b, n, t, h)
+    else:
+      b, t, n, _ = query.shape
+      _, _, _, h = value.shape
+      output_shape = (b, t, n, h)
+
+    max_seg_per_batch = fused_attn.get_max_seg_per_batch(q_offsets)
+    softmax_stat_shape = (b * max_seg_per_batch, n, t)
+
+    out_sharding, stat_sharding = _dot_product_attention_fwd_sharding_rule(
+        query, key, value, layout
+    )
+
+    if is_training:
+      return (
+          jax_core.ShapedArray(output_shape, query.dtype, sharding=out_sharding),
+          jax_core.ShapedArray(
+              softmax_stat_shape, np.float32, sharding=stat_sharding
+          ),
+      )
+    return (jax_core.ShapedArray(output_shape, query.dtype, sharding=out_sharding),)
+
+  def _dot_product_attention_bwd_abstract(
+      query,
+      key,
+      value,
+      bias,
+      q_seqlen,
+      kv_seqlen,
+      q_offsets,
+      kv_offsets,
+      page_table_k,
+      page_table_v,
+      activation,
+      fwd_output,
+      grad_output,
+      *,
+      scale,
+      seed,
+      dropout_rate,
+      variadic_args,
+      mask_type,
+      layout,
+      sliding_window_length,
+  ):
+    del q_seqlen
+    del kv_seqlen
+    del q_offsets
+    del kv_offsets
+    del page_table_k
+    del page_table_v
+    del activation
+    del fwd_output
+    del grad_output
+    del scale
+    del seed
+    del dropout_rate
+    del mask_type
+    del sliding_window_length
+
+    _, has_dbias = variadic_args
+    grad_shardings = _dot_product_attention_bwd_sharding_rule(
+        query, key, value, bias, has_dbias=has_dbias, layout=layout
+    )
+    if has_dbias:
+      grad_shardings = cast(tuple[Any, Any, Any, Any], grad_shardings)
+      return (
+          jax_core.ShapedArray(query.shape, query.dtype, sharding=grad_shardings[0]),
+          jax_core.ShapedArray(key.shape, key.dtype, sharding=grad_shardings[1]),
+          jax_core.ShapedArray(value.shape, value.dtype, sharding=grad_shardings[2]),
+          jax_core.ShapedArray(bias.shape, bias.dtype, sharding=grad_shardings[3]),
+      )
+    grad_shardings = cast(tuple[Any, Any, Any], grad_shardings)
+    return (
+        jax_core.ShapedArray(query.shape, query.dtype, sharding=grad_shardings[0]),
+        jax_core.ShapedArray(key.shape, key.dtype, sharding=grad_shardings[1]),
+        jax_core.ShapedArray(value.shape, value.dtype, sharding=grad_shardings[2]),
+    )
+
+  primitives_to_patch = [
+      "_dot_product_attention_fwd_p",
+      "_dot_product_attention_fwd_p_wrapper",
+      "_dot_product_attention_bwd_p",
+      "_dot_product_attention_bwd_p_wrapper",
+  ]
+  for primitive_name in primitives_to_patch:
+    primitive = getattr(fused_attn, primitive_name, None)
+    if primitive is None:
+      continue
+    if "bwd" in primitive_name:
+      primitive.def_abstract_eval(_dot_product_attention_bwd_abstract)
+    else:
+      primitive.def_abstract_eval(_dot_product_attention_fwd_abstract)
+
+
+_override_cudnn_flash_attention_abstract_eval()
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("LOGLEVEL", "INFO"))

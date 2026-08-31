@@ -789,8 +789,8 @@ class YarnRotaryEmbedding(nnx.Module):
        when `rope_factor > 1`. This scaling can be applied within this layer (if `attention_scaling=True`)
        or externally.
   - RoPE Implementation Details (General):
-    - Arithmetic: Uses complex number arithmetic. Real number arithmetic is not implemented here,
-      though the resulting embeddings would be equivalent.
+    - Arithmetic: Uses real-valued sin/cos arithmetic that is mathematically equivalent to the
+      complex-number formulation, while avoiding complex-valued intermediates.
     - Input Layout: Supports both interleaved (`interleave=True`, e.g., [real1, img1, real2, img2]) and
       concatenated (`interleave=False`, e.g., [real1, real2, img1, img2]) formats.
     - Output Layout: Always returns concatenated format ([real, imag]). Interleaved output is not
@@ -859,8 +859,8 @@ class YarnRotaryEmbedding(nnx.Module):
       raise ValueError("Embedding dim for rotary position embedding must be a multiple of 2.")
 
   @property
-  def freqs_cis(self):
-    """Frequencies for rotary embedding."""
+  def freqs(self):
+    """Phase angles for rotary embedding."""
     half_dim = self.embedding_dims // 2
     # Compute base frequencies for each (even-indexed) dimension.
     # (Note: We use jnp.arange with float32 for precision.)
@@ -881,10 +881,12 @@ class YarnRotaryEmbedding(nnx.Module):
     # Precompute frequencies for all positions by taking the outer product.
     t = jnp.arange(self.max_position_embeddings, dtype=jnp.float32)  # shape [max_position_embeddings]
     # This gives a [max_position_embeddings, half_dim] tensor with rows as time steps.
-    freqs = jnp.outer(t, freqs)
+    return jnp.outer(t, freqs)
 
-    # Compute the complex “cis” values: exp(i * theta).
-    return jnp.exp(1j * freqs)  # shape [max_position_embeddings, half_dim]
+  @property
+  def freqs_cis(self):
+    """Alias for backward compatibility (returns phase angles, not complex cis)."""
+    return self.freqs
 
   def _find_correction_dim(self, num_rotations: float, dim: int, base: float, max_position_embeddings: int) -> float:
     """Compute the correction dimension for a given number of rotations."""
@@ -932,7 +934,7 @@ class YarnRotaryEmbedding(nnx.Module):
     return jnp.clip(linear_func, 0, 1)
 
   def __call__(self, inputs: Array, position: None | Array = None) -> Array:
-    """Applies the rotary positional embedding using the precomputed complex frequencies.
+    """Applies rotary positional embedding using real-valued sin/cos transforms.
 
     Args:
       inputs: jax.Array of shape [B, S, N, H]. (H must equal self.embedding_dims.)
@@ -955,38 +957,39 @@ class YarnRotaryEmbedding(nnx.Module):
     else:
       position = position.astype(jnp.int32)
 
-    # Lookup the precomputed frequencies using the position indices.
-    # self.freqs_cis has shape [max_position_embeddings, half_dim] so we use jnp.take along axis 0.
+    # Lookup the precomputed phase angles using the position indices.
+    # self.freqs has shape [max_position_embeddings, half_dim] so we use gather along axis 0.
     # After indexing, shape becomes [B, S, half_dim]; we then add an axis for the heads.
-    freqs = self.freqs_cis.at[position].get(out_sharding=self.freqs_sharding)  # shape: [B, S, half_dim]
+    freqs = self.freqs.at[position].get(out_sharding=self.freqs_sharding)  # shape: [B, S, half_dim]
     freqs = freqs[:, :, jnp.newaxis, :]  # shape: [B, S, 1, half_dim]
 
     if self.interleave:
-      # Inputs with interleaved format [real1, img1, real2, img2, ...] at last dimension
-      # Convert the last dimension into a complex representation.
-      # First reshape so that each pair of numbers represents the real and imaginary parts.
+      # Inputs with interleaved format [real1, img1, real2, img2, ...].
       B, S, N, H = inputs.shape
       half_dim = H // 2
       inputs_reshaped = inputs.reshape(B, S, N, half_dim, 2)
       first_half, second_half = inputs_reshaped[..., 0], inputs_reshaped[..., 1]
     else:
-      # Inputs with concatenated format [real1, real2, ..., img1, img2, ...] at last dimension
+      # Inputs with concatenated format [real1, real2, ..., img1, img2, ...].
       first_half, second_half = jnp.split(inputs, 2, axis=-1)
 
-    inputs_complex = first_half + 1j * second_half  # shape: [B, S, N, half_dim]
-    # Apply the rotary transformation via complex multiplication.
+    # Keep real-valued intermediates to avoid complex residuals under remat.
+    first_half = jnp.asarray(first_half, jnp.float32)
+    second_half = jnp.asarray(second_half, jnp.float32)
+    cos = jnp.cos(freqs).astype(jnp.float32)
+    sin = jnp.sin(freqs).astype(jnp.float32)
+
     rotated_sharding = (
         create_sharding(self.mesh, ("activation_batch", "activation_length", None, None))
         if self.shard_mode == ShardMode.EXPLICIT
         else None
     )
-    freqs = jnp.broadcast_to(freqs, inputs_complex.shape, out_sharding=rotated_sharding)
-    rotated = jnp.multiply(inputs_complex, freqs)  # shape: [B, S, N, half_dim]
+    cos = jnp.broadcast_to(cos, first_half.shape, out_sharding=rotated_sharding)
+    sin = jnp.broadcast_to(sin, first_half.shape, out_sharding=rotated_sharding)
 
-    # Convert the complex result back to a real tensor.
-    # Split the complex number into its real and imaginary parts.
-    # [real1, real2, ..., img1, img2, ...]
-    output = jnp.concatenate([jnp.real(rotated), jnp.imag(rotated)], axis=-1)
+    rotated_real = first_half * cos - second_half * sin
+    rotated_imag = first_half * sin + second_half * cos
+    output = jnp.concatenate([rotated_real, rotated_imag], axis=-1)
 
     if self.attention_scaling:
       attention_scaling = 1.0 if self.rope_factor <= 1 else (0.1 * math.log(self.rope_factor) + 1.0)

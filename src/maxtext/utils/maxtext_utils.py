@@ -128,9 +128,16 @@ def get_reorder_callable(cp_size, shard_mode):
   return functools.partial(shard_reorder_causal_load_balanced, cp_size=cp_size, shard_mode=shard_mode)
 
 
-def get_shaped_batch(config):
+def get_shaped_batch(config, data_sharding=None):
   """Return the shape of the batch - this is what eval_shape would return for the
-  output of create_data_iterator, but eval_shape doesn't work, see b/306901078."""
+  output of create_data_iterator, but eval_shape doesn't work, see b/306901078.
+
+  Args:
+    config: MaxText configuration.
+    data_sharding: Optional NamedSharding for the batch data. When provided,
+      each ShapeDtypeStruct is annotated with this sharding so that jaxpp's
+      explicit-sharding path can match aval shardings to in_shardings.
+  """
   if config.enable_diloco:
     batch_shape = (
         config.num_diloco_replicas,
@@ -140,12 +147,12 @@ def get_shaped_batch(config):
   else:
     batch_shape = (config.global_batch_size_to_load, config.max_target_length)
   shaped_batch = {}
-  shaped_batch["inputs"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
-  shaped_batch["inputs_position"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
-  shaped_batch["inputs_segmentation"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
-  shaped_batch["targets"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
-  shaped_batch["targets_position"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
-  shaped_batch["targets_segmentation"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
+  shaped_batch["inputs"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=data_sharding)
+  shaped_batch["inputs_position"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=data_sharding)
+  shaped_batch["inputs_segmentation"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=data_sharding)
+  shaped_batch["targets"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=data_sharding)
+  shaped_batch["targets_position"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=data_sharding)
+  shaped_batch["targets_segmentation"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32, sharding=data_sharding)
   if config.use_dpo:
     shaped_batch["chosen"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
     shaped_batch["chosen_position"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
@@ -1025,18 +1032,49 @@ def calculate_prefill_tflops_per_device(num_model_parameters, prefill_length, co
   return total_tflops, learnable_weight_tflops, causal_attention_tflops
 
 
-def apply_gradient_clipping(raw_grads, state, clipping_threshold):
+def _clip_by_global_norm(g_norm: jax.Array, max_norm: float) -> optax.GradientTransformation:
+  """Like optax.clip_by_global_norm, but takes a precomputed global norm.
+
+  Used for JaxPP, whose pipeline stages live in physically separate SPMD
+  sub-meshes: the norm must be reduced across stages via
+  jaxpp.cross_mpmd_all_reduce (see [[max_utils.l2norm_pytree_mpmd]]) before it
+  can be used here, so it can't be recomputed locally inside this transform.
+  """
+  from optax._src import base as optax_base  # pylint: disable=import-outside-toplevel
+  import chex  # pylint: disable=import-outside-toplevel
+
+  def update_fn(updates, state, params=None):
+    del params
+    trigger = jnp.squeeze(g_norm < max_norm)
+    chex.assert_shape(trigger, ())  # A scalar.
+
+    def clip_fn(t):
+      return jax.lax.select(trigger, t, (t / g_norm.astype(t.dtype)) * max_norm)
+
+    updates = jax.tree.map(clip_fn, updates)
+    return updates, state
+
+  return optax.GradientTransformation(optax_base.init_empty_state, update_fn)
+
+
+def apply_gradient_clipping(raw_grads, state, clipping_threshold, precomputed_norm=None):
   """Applies gradient clipping to raw gradients, with special handing for FLAX fp8 stats.
 
   Args:
     raw_grads: A pytree of raw gradients.
     state: The current optimizer state.
     clipping_threshold: The gradient clipping threshold.
+    precomputed_norm: Optional precomputed global gradient norm to clip against
+      (e.g. from [[max_utils.l2norm_pytree_mpmd]] under JaxPP). When None, the
+      norm is recomputed locally, matching plain optax.clip_by_global_norm.
 
   Returns:
     A pytree of clipped gradients.
   """
-  gradient_clip_transformation = optax.clip_by_global_norm(clipping_threshold)
+  if precomputed_norm is not None:
+    gradient_clip_transformation = _clip_by_global_norm(precomputed_norm, clipping_threshold)
+  else:
+    gradient_clip_transformation = optax.clip_by_global_norm(clipping_threshold)
   if OVERWRITE_WITH_GRADIENT in raw_grads:
     # Scales + Amax History for Delayed Tensor Scaling SHOULD NOT be clipped or affect clipping
     fp8_stats = raw_grads.pop(OVERWRITE_WITH_GRADIENT)

@@ -91,6 +91,21 @@ def parse_libtpu_flags_to_dict(flags_str: str) -> dict:
   return options_dict
 
 
+def maybe_unwrap(a):
+  """Unwraps a JaxPP MpmdArray to a representative jax.Array, if applicable.
+
+  JaxPP is an optional dependency (see [[jaxpp_code_changes]]), so the import is
+  lazy and non-jaxpp values are returned unchanged when it isn't installed.
+  """
+  try:
+    import jaxpp.api as jaxpp  # pylint: disable=import-outside-toplevel
+  except ImportError:
+    return a
+  if isinstance(a, jaxpp.MpmdArray):
+    return v if (v := a.first_mpmd_replica) is not None else 0
+  return a
+
+
 def with_memory_kind(t, memory_kind):
   return jax.tree_util.tree_map(lambda x: x.with_memory_kind(kind=memory_kind), t)
 
@@ -111,6 +126,20 @@ def find_nans_and_infs(pytree):
 def l2norm_pytree(x):
   """L2 norm of a pytree of arrays."""
   return jnp.sqrt(jax.tree_util.tree_reduce(lambda x, y: x + jnp.sum(jnp.square(y)), x, initializer=0.0))
+
+
+def l2norm_pytree_mpmd(x):
+  """L2 norm of a pytree of arrays, reduced across JaxPP pipeline stages.
+
+  JaxPP's pipeline stages live in physically separate SPMD sub-meshes, so a
+  plain tree-reduce (as in [[l2norm_pytree]]) can't cross stage boundaries;
+  this uses jaxpp.cross_mpmd_all_reduce instead. Only call this when
+  config.use_jaxpp is True.
+  """
+  import jaxpp.api as jaxpp  # pylint: disable=import-outside-toplevel
+
+  per_param_sum = [jnp.sum(jnp.square(leaf)) for leaf in jax.tree.leaves(x)]
+  return jnp.sqrt(jaxpp.cross_mpmd_all_reduce(*(e.astype(jnp.float32) for e in per_param_sum)))
 
 
 def calculate_num_params_from_pytree(params):

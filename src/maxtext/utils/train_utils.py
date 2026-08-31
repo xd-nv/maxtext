@@ -118,7 +118,10 @@ def create_checkpoint_manager(config, mesh, init_state_fn):
   return checkpoint_manager
 
 
-def jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, params_shardings, mesh=None):
+def jit_train_step(
+    config, model, state, state_mesh_shardings, data_sharding, train_step, params_shardings, mesh=None,
+    maybe_mpmd_mesh=None,
+):
   """Returns a JIT-compiled train step function, which is loaded from a file if specified in the config."""
   if config.enable_diloco:
     functional_train = train_step
@@ -146,7 +149,7 @@ def jit_train_step(config, model, state, state_mesh_shardings, data_sharding, tr
     # Need to pass train signature and state to determine i/o shapes of train_state for now.
     p_train_step = maxtext_utils.load_compiled(config, functional_train, state, execution_devices)
     max_logging.log("Loaded compiled function!")
-  else:
+  elif not config.use_jaxpp:
     p_train_step = jax.jit(
         functional_train,
         in_shardings=in_shardings,
@@ -154,11 +157,23 @@ def jit_train_step(config, model, state, state_mesh_shardings, data_sharding, tr
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
     )
+  else:
+    import jaxpp.api as jaxpp  # pylint: disable=import-outside-toplevel
+
+    max_logging.log("Running with jaxpp")
+    assert maybe_mpmd_mesh is not None
+    p_train_step = jaxpp.mpmd_jit_with_loop(
+        functional_train,
+        mpmd_mesh=maybe_mpmd_mesh,
+        in_shardings=jax.tree.map(lambda x: x.spec, in_shardings),
+        out_shardings=jax.tree.map(lambda x: x.spec, out_shardings),
+        donate_argnums=donate_argnums,
+    )
 
   return p_train_step
 
 
-def jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step):
+def jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step, maybe_mpmd_mesh=None):
   """Returns a JIT-compiled eval step function."""
   (
       functional_eval,
@@ -170,13 +185,26 @@ def jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step)
 
   p_eval_step = None
   if config.compiled_trainstep_file == "":
-    p_eval_step = jax.jit(
-        functional_eval,
-        in_shardings=in_shardings,
-        out_shardings=out_shardings,
-        static_argnums=static_argnums,
-        donate_argnums=donate_argnums,
-    )
+    if not config.use_jaxpp:
+      p_eval_step = jax.jit(
+          functional_eval,
+          in_shardings=in_shardings,
+          out_shardings=out_shardings,
+          static_argnums=static_argnums,
+          donate_argnums=donate_argnums,
+      )
+    else:
+      import jaxpp.api as jaxpp  # pylint: disable=import-outside-toplevel
+
+      assert maybe_mpmd_mesh is not None
+      p_eval_step = jaxpp.mpmd_jit_by_yield(
+          functional_eval,
+          mpmd_mesh=maybe_mpmd_mesh,
+          in_shardings=in_shardings,
+          out_shardings=out_shardings,
+          static_argnums=static_argnums,
+          donate_argnums=donate_argnums,
+      )
 
   return p_eval_step
 
@@ -191,6 +219,7 @@ def jit_train_and_eval_step(
     eval_step=None,
     eval_data_iterator=None,
     params_shardings=None,
+    maybe_mpmd_mesh=None,
 ):
   """Returns a JIT-compiled train and eval step function."""
   if config.enable_diloco:
@@ -198,11 +227,14 @@ def jit_train_and_eval_step(
     train_step = diloco.build_diloco_train_step(config, train_step_partial, mesh=mesh)
   data_sharding = sharding.get_input_data_sharding(config, mesh)
   p_train_step = jit_train_step(
-      config, model, state, state_mesh_shardings, data_sharding, train_step, params_shardings, mesh=mesh
+      config, model, state, state_mesh_shardings, data_sharding, train_step, params_shardings, mesh=mesh,
+      maybe_mpmd_mesh=maybe_mpmd_mesh,
   )
   p_eval_step = None
   if eval_data_iterator:
-    p_eval_step = jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step)
+    p_eval_step = jit_eval_step(
+        config, model, state_mesh_shardings, data_sharding, eval_step, maybe_mpmd_mesh=maybe_mpmd_mesh
+    )
 
   return p_train_step, p_eval_step
 

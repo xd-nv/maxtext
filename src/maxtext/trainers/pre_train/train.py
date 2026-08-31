@@ -78,7 +78,7 @@ VertexTensorboardManager, _vertex_tb_is_stub = vertex_tensorboard_modules()
 
 def get_first_step(model, state):
   if isinstance(model, nn.Module):
-    return int(state.step)
+    return int(max_utils.maybe_unwrap(state.step))
   return int(state.optimizer.step.get_value())
 
 
@@ -103,7 +103,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
     aux: a dictionary including intermediate_outputs, xent_sum, and total_weights
   """
   # decimate proportion of data when per_device_batch_size<1
-  if is_train:
+  if is_train and not config.use_jaxpp:
     for k, v in data.items():
       data[k] = v[: config.micro_batch_size_to_train_on, :]
   else:
@@ -305,7 +305,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
 
   params = state.params
 
-  if config.gradient_accumulation_steps > 1:
+  if config.gradient_accumulation_steps > 1 or config.use_jaxpp:
     loss, aux, raw_grads = gradient_accumulation_loss_and_grad(
         _loss_fn,
         config,
@@ -355,8 +355,15 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   moe_bias_updates = aux.get("moe_bias_updates")
   mtp_loss = aux.get("mtp_loss", 0.0)
 
+  # JaxPP's pipeline stages live in physically separate SPMD sub-meshes, so norms must be
+  # reduced across stages via jaxpp.cross_mpmd_all_reduce instead of a plain local tree-reduce.
+  _l2norm = max_utils.l2norm_pytree_mpmd if config.use_jaxpp else max_utils.l2norm_pytree
+  raw_grad_norm = _l2norm(raw_grads)
+
   if config.gradient_clipping_threshold > 0:
-    grads = maxtext_utils.apply_gradient_clipping(raw_grads, state, config.gradient_clipping_threshold)
+    grads = maxtext_utils.apply_gradient_clipping(
+        raw_grads, state, config.gradient_clipping_threshold, precomputed_norm=raw_grad_norm
+    )
   else:
     grads = raw_grads
 
@@ -406,7 +413,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     )
 
   if getattr(config, "skip_step_on_spikes", False):
-    grad_norm = max_utils.l2norm_pytree(grads)
+    grad_norm = _l2norm(grads)
     # TrainState.apply_gradients doesn't pass **kwargs to tx.update, so we unpack it manually.
     updates, new_opt_state = state.tx.update(grads, state.opt_state, state.params, loss=loss, grad_norm=grad_norm)
     new_params = optax.apply_updates(state.params, updates)
@@ -472,9 +479,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       scalar_metrics["learning/max_logits"] = global_max_logit
 
   if not config.optimizer_memory_host_offload:
-    scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
-    scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
-    scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_state.params)
+    scalar_metrics["learning/grad_norm"] = _l2norm(grads)
+    scalar_metrics["learning/raw_grad_norm"] = raw_grad_norm
+    scalar_metrics["learning/param_norm"] = _l2norm(new_state.params)
   if config.use_dpo:
     scalar_metrics["learning/dpo_loss"] = aux["dpo_loss"]
     scalar_metrics["learning/dpo_reward_accuracy"] = aux["reward_accuracy"]
@@ -577,6 +584,9 @@ def train_loop(config, recorder, state=None):
       state,
   ) = train_utils.setup_train_loop(config, recorder)
 
+  if config.use_jaxpp:
+    assert checkpoint_manager is None, "Checkpointing is not supported together with JaxPP."
+
   if config.use_dpo:
     if "reference_params" not in state.params:
       reference_params = jax.tree.map(jnp.copy, state.params["params"])
@@ -584,6 +594,13 @@ def train_loop(config, recorder, state=None):
     state_mesh_shardings = _merge_dpo_state(state_mesh_shardings, state_mesh_shardings.params["params"])
 
   params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
+
+  mpmd_mesh = None
+  if config.use_jaxpp:
+    import jaxpp.api as jaxpp  # pylint: disable=import-outside-toplevel
+
+    mpmd_mesh = jaxpp.MpmdMesh(mesh, "stage")
+    mesh = mpmd_mesh.lowering_mesh()
 
   with jax.set_mesh(mesh), mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
     p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
@@ -596,15 +613,23 @@ def train_loop(config, recorder, state=None):
         eval_step,
         eval_data_iterator,
         params_shardings,
+        maybe_mpmd_mesh=mpmd_mesh,
     )
-    shaped_batch = maxtext_utils.get_shaped_batch(config)
-    if config.shard_optimizer_over_data:
-      state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
-    maxtext_utils.maybe_dump_jaxpr(config, p_train_step, (state, shaped_batch, init_rng))
-    if config.compiled_trainstep_file == "":  # compile only when there is no pre-compiled file loaded
-      compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
-      compiled_stats = compiled.memory_analysis()
-      max_utils.print_compiled_memory_stats(compiled_stats)
+    if config.use_jaxpp:
+      data_sharding = sharding.get_input_data_sharding(config, mesh)
+      shaped_batch = maxtext_utils.get_shaped_batch(config, data_sharding=data_sharding)
+      p_train_step = p_train_step.compile(state, shaped_batch, init_rng)
+      args_mpmd_shardings, _ = p_train_step.in_shardings
+      state = jaxpp.spmd_to_mpmd_reshard(mpmd_mesh, state, args_mpmd_shardings[0])
+    else:
+      shaped_batch = maxtext_utils.get_shaped_batch(config)
+      if config.shard_optimizer_over_data:
+        state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
+      maxtext_utils.maybe_dump_jaxpr(config, p_train_step, (state, shaped_batch, init_rng))
+      if config.compiled_trainstep_file == "":  # compile only when there is no pre-compiled file loaded
+        compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
+        compiled_stats = compiled.memory_analysis()
+        max_utils.print_compiled_memory_stats(compiled_stats)
 
   start_step = get_first_step(model, state)  # this is the start_step for training
   prof = profiler.Profiler(config, offset_step=start_step)
@@ -623,9 +648,13 @@ def train_loop(config, recorder, state=None):
         example_batch = data_loader.load_next_batch(rampup_manager=rampup_manager)
         # pylint: disable=not-callable
         nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
+        if config.use_jaxpp:
+          example_batch, nextrng = jaxpp.spmd_to_mpmd_reshard(
+              mpmd_mesh, (example_batch, nextrng), p_train_step.in_shardings[0][1:]
+          )
         with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
           with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
-            if config.shard_optimizer_over_data:
+            if config.shard_optimizer_over_data and not config.use_jaxpp:
               state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
             state, metrics = p_train_step(state, example_batch, nextrng)
 
@@ -672,6 +701,10 @@ def train_loop(config, recorder, state=None):
         max_utils.print_mem_stats("After params initialized")
 
       metric_logger.buffer_and_write_train_metrics(metrics, step, step_time_delta)
+
+    if config.use_jaxpp:
+      assert mpmd_mesh is not None
+      state = jaxpp.mpmd_to_spmd_reshard(mpmd_mesh, state, state_mesh_shardings)
 
     if config.save_checkpoint_on_completion:
       state_to_save = state if not config.use_dpo else _split_dpo_state(state)[0]

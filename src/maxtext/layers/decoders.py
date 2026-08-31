@@ -17,7 +17,7 @@
 # pylint: disable=no-name-in-module
 
 import functools
-from typing import Any
+from typing import Any, Sequence
 import warnings
 
 from flax import linen as nn
@@ -336,6 +336,47 @@ def _assert_compound_etp1_moe_scan_layout(moe_params, cfg, num_moe_layers):
   )
 
 
+# ---------------------------------------------------------------------------
+# Named-checkpoint helpers (used by the "named_checkpoint" remat policy)
+# ---------------------------------------------------------------------------
+
+def parse_named_checkpoint_names(csv: str) -> tuple[str, ...]:
+    """Parse a comma-separated string of checkpoint_name() tags.
+
+    Args:
+        csv: Comma-separated list (e.g. ``"out_proj,query_proj"``).
+             Empty / whitespace-only → empty tuple.
+    Returns:
+        Tuple of stripped, non-empty name strings.
+    """
+    if not csv or not csv.strip():
+        return ()
+    return tuple(name.strip() for name in csv.split(",") if name.strip())
+
+
+def save_cudnn_flash_attention(prim, *_, **__) -> bool:
+    """Checkpoint policy predicate: save cuDNN flash-attention forward outputs."""
+    return (
+        prim
+        is jax._src.cudnn.fused_attention_stablehlo._dot_product_attention_fwd_p_wrapper
+    )
+
+def named_checkpoint_policy_from_names(names: Sequence[str]):
+    return jax.checkpoint_policies.save_from_both_policies(
+        jax.checkpoint_policies.save_only_these_names(*names),
+        save_cudnn_flash_attention,
+    )
+
+def named_checkpoint_policy(cfg):
+    """Build the ``named_checkpoint`` remat policy from *cfg*.
+
+    Saves the checkpoint_name() tags listed in ``cfg.named_checkpoint_names``
+    **and** cuDNN flash-attention forward outputs.
+    """
+    names = parse_named_checkpoint_names(cfg.named_checkpoint_names)
+    return named_checkpoint_policy_from_names(names)
+
+
 class Decoder(nn.Module):
   """A stack of decoder layers as a part of an encoder-decoder architecture."""
 
@@ -475,6 +516,9 @@ class Decoder(nn.Module):
         policy = jax.checkpoint_policies.save_only_these_names(
             "out_proj",
         )
+      elif cfg.remat_policy == "named_checkpoint":
+        policy = named_checkpoint_policy(cfg)
+        max_logging.log(f"Remat policy named_checkpoint: {parse_named_checkpoint_names(cfg.named_checkpoint_names)}")
       else:
         assert cfg.remat_policy == "full", "Remat policy needs to be on list of remat policies"
         policy = None
@@ -843,7 +887,7 @@ class Decoder(nn.Module):
         deterministic,
         model_mode,
     )
-    if cfg.using_pipeline_parallelism:
+    if cfg.using_pipeline_parallelism and not cfg.use_jaxpp:
       logical_partition_spec = (
           self.pipeline_module.get_weight_sharding(y, decoder_segment_ids, decoder_positions, deterministic, model_mode)
           if cfg.pipeline_fsdp_ag_once or cfg.pipeline_fsdp_ag_per_repeat
@@ -895,6 +939,7 @@ class Decoder(nn.Module):
             )(y, *broadcast_args)
     else:
       if cfg.scan_layers:
+        assert not cfg.use_jaxpp, "Layer scanning is not supported with JaxPP"
         if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
           assert len(RemattedBlockLayers) == 2, "Scanned layers must have a length of 2 using deepseek."
           layer_call_kwargs = {
@@ -1060,6 +1105,25 @@ class Decoder(nn.Module):
               **layer_kwargs,
           )(y, *broadcast_args)
       else:
+        num_logical_stages = 1
+        layers_per_stage = cfg.num_decoder_layers
+        cutoffs = [cfg.num_decoder_layers]
+        if cfg.use_jaxpp:
+          import jaxpp  # pylint: disable=import-outside-toplevel
+
+          num_logical_stages = cfg.dcn_pipeline_parallelism * cfg.ici_pipeline_parallelism * cfg.num_pipeline_repeats
+          layers_per_stage, rem = divmod(cfg.num_decoder_layers, num_logical_stages)
+          assert layers_per_stage > 0, (cfg.num_decoder_layers, num_logical_stages)
+          cutoffs = []
+          tot = 0
+          for stage in range(num_logical_stages):
+            num_layers_in_pipeline_stage = layers_per_stage + (1 if stage < rem else 0)
+            tot += num_layers_in_pipeline_stage
+            cutoffs.append(tot - 1)
+
+          max_logging.log(f"JaxPP stage end layer idx: {cutoffs}")
+
+        stage_id = 0
         if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
           assert len(RemattedBlockLayers) == 2, "Unscanned layers must have a length of 2 using deepseek."
           dense_layer = RemattedBlockLayers[0]
@@ -1098,6 +1162,9 @@ class Decoder(nn.Module):
               )
               if kv_caches is not None and kv_cache is not None:
                 kv_caches[index] = kv_cache
+              if cfg.use_jaxpp and global_layer_idx != cfg.num_decoder_layers - 1 and cutoffs[stage_id] == global_layer_idx:
+                y = jaxpp.api.pipeline_enter_stage(y, f"stage_{stage_id}")
+                stage_id += 1
             global_layer_idx_offset += num_layers
         else:
           for lyr in range(cfg.num_decoder_layers):
@@ -1133,7 +1200,8 @@ class Decoder(nn.Module):
               layer_kwargs = {"attention_type": gpt_oss.get_attention_type(layer_id=lyr)}
             if cfg.decoder_block == DecoderBlockType.OLMO3:
               layer_kwargs = {"attention_type": olmo3.get_attention_type(layer_id=lyr)}
-            layer = RemattedBlockLayer(
+            layer_ctor = RemattedBlockLayer if (not cfg.use_jaxpp or stage_id != num_logical_stages - 1) else self.decoder_layer[0]
+            layer = layer_ctor(
                 config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant, model_mode=self.model_mode, **layer_kwargs
             )
             y, returned_cache = layer(
@@ -1162,6 +1230,10 @@ class Decoder(nn.Module):
               bidirectional_mask_value = multimodal_input.bidirectional_mask if multimodal_input is not None else None
               if bidirectional_mask_value is not None and visual_embeds is not None:
                 y = deepstack_process(y, bidirectional_mask_value, visual_embeds)
+
+            if cfg.use_jaxpp and lyr != cfg.num_decoder_layers - 1 and cutoffs[stage_id] == lyr:
+              y = jaxpp.api.pipeline_enter_stage(y, f"stage_{stage_id}")
+              stage_id += 1
 
     assert isinstance(y, jax.Array)
 
@@ -1195,6 +1267,9 @@ class Decoder(nn.Module):
 
     else:
       logits = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
+
+    if cfg.use_jaxpp and logits is not None:
+      logits = jaxpp.api.pipeline_enter_stage(logits, f"stage_{stage_id}")
 
     # The API of the Decoder is now a tuple, providing both the main output
     # and the raw hidden state needed for auxiliary tasks.
