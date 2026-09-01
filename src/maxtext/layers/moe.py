@@ -1718,20 +1718,9 @@ class RoutedMoE(nnx.Module):
     if isinstance(wo_kernel, aqt.QTensor):
       wo_pspec = aqt.partition_spec(wo_pspec, (1,), wo_kernel.dtype, use_bias=False)
 
-    # Under JaxPP, this code traces once per pipeline stage with the ambient
-    # context mesh's "stage" axis narrowed to 1 (JaxPP's tracer virtualizes it
-    # between pipeline_enter_stage markers), while self.mesh is the full
-    # physical mesh captured once at model construction (real stage size).
-    # shard_map requires its mesh= to match the ambient context mesh exactly,
-    # so use the context mesh directly here instead of the stale self.mesh --
-    # same idiom already used elsewhere in this repo for "the mesh currently
-    # in effect" (te_overlay/transformer_engine/jax/sharding.py,
-    # kernels/gather_reduce_sc.py).
-    shard_map_mesh = jax.sharding.get_abstract_mesh() if self.config.use_jaxpp else self.mesh
-
     @functools.partial(
         jax.shard_map,
-        mesh=shard_map_mesh,
+        mesh=self.mesh,
         in_specs=(
             input_partition_pspec,
             gate_logits_pspec,
