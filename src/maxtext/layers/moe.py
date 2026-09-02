@@ -1723,16 +1723,22 @@ class RoutedMoE(nnx.Module):
     # between pipeline_enter_stage markers), while self.mesh is the full
     # physical mesh captured once at model construction (real stage size).
     # shard_map requires its mesh= to match the ambient context mesh exactly,
-    # so use the context mesh directly here instead of the stale self.mesh --
-    # same idiom already used elsewhere in this repo for "the mesh currently
-    # in effect" (te_overlay/transformer_engine/jax/sharding.py,
-    # kernels/gather_reduce_sc.py), and the same pattern JaxPP's own validated
-    # MaxiMoE reference uses (examples/maximoe/src/maximoe/model.py:
-    # `mesh = mesh if mesh is not None else jax.sharding.get_abstract_mesh()`).
-    # Requires third_party/jaxpp >= fd65123 ("Rebind nested meshes under
-    # abstract shard maps") -- older pins drop this equation entirely instead
-    # of just skipping the mesh rewrite (see git log on that commit).
-    shard_map_mesh = jax.sharding.get_abstract_mesh() if self.config.use_jaxpp else self.mesh
+    # so use the context mesh directly here instead of the stale self.mesh.
+    #
+    # jax.sharding.get_abstract_mesh() does NOT work here: this code traces
+    # inside jaxpp's gradient_accumulation.py path, which builds its jaxpr via
+    # jax.interpreters.partial_eval.trace_to_jaxpr_dynamic (jaxpp/training.py
+    # pscan_wrapped) rather than jax.jit -- that doesn't propagate the ambient
+    # jax.set_mesh() thread-local the way jax.jit does, so get_abstract_mesh()
+    # returns an empty AbstractMesh here ("shard_map requires a non-empty
+    # mesh. Got AbstractMesh((), axis_types=())", confirmed even after
+    # bumping past fd65123). Instead, read the mesh off one of the actual
+    # traced arguments' sharding -- jaxpp's own machinery correctly threads a
+    # stage-local mesh onto array shardings independent of that thread-local
+    # context, matching the idiom jaxpp uses internally (e.g.
+    # `jax.set_mesh(array.sharding.mesh)` in jaxpp/array_ops.py,
+    # examples/mpmd.py).
+    shard_map_mesh = jax.typeof(inputs).sharding.mesh if self.config.use_jaxpp else self.mesh
 
     @functools.partial(
         jax.shard_map,
