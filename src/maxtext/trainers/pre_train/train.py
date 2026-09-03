@@ -561,14 +561,15 @@ def train_loop(config, recorder, state=None):
     ffi_set_buffer_manager(mgr)
     max_logging.log("HybridEP buffer manager initialized")
 
-  # Initialize TE NCCL EP BEFORE setup_train_loop, because model creation traces
-  # moe.py which calls ep_dispatch — the process-singleton communicator must be
-  # live by then. The MeshResource (with ep_resource="expert") is already active
-  # via the outer transformer_engine_context wrapping run() in `initialize`.
-  if config.use_te_ep:
-    from maxtext.layers import te_ep_init  # pylint: disable=import-outside-toplevel
-
-    te_ep_init.init_te_ep_for_maxtext(config, maxtext_utils.get_mesh_from_config(config))
+  # TE NCCL EP is now initialized inside train_utils.setup_train_loop, right
+  # after mesh construction (and, under use_jaxpp, MpmdMesh narrowing) and
+  # before model creation -- moved there so the bootstrap sees the
+  # jaxpp-narrowed mesh instead of the full physical one. Do not call
+  # init_te_ep_for_maxtext here too: it's idempotent for a *matching*
+  # config_key, but calling it here first (before setup_train_loop, hence
+  # before any MpmdMesh exists) would bootstrap the communicator against the
+  # wrong (full, un-narrowed) mesh and the later, correct call inside
+  # setup_train_loop would just silently return that already-wrong state.
 
   (
       init_rng,

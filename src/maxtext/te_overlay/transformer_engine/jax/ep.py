@@ -76,6 +76,70 @@ def _allgather_uid(uid_arr, world_size, uid_size):
     return np.asarray(g_out).reshape(world_size, uid_size)
 
 
+def _publish_and_fetch_domain_uid(uid_bytes, is_color_root, root_rank, uid_size):
+    """Resolve one EP domain's NCCL UID via a point-to-point KV rendezvous.
+
+    Only `all_uids[root_rank]` is ever read out of `_allgather_uid`'s result
+    (see call site below) -- every other row is gathered and discarded. This
+    does the same job (the domain's root publishes its UID, every member of
+    the domain reads it back) without requiring a whole-job gather, by using
+    JAX's distributed coordination-service key-value store directly, keyed
+    by `root_rank` (globally unique per domain -- see `_ep_domain_for_rank`).
+
+    This is the same put/get rendezvous pattern JaxPP uses for its own
+    inter-stage NCCL communicators (`jaxpp.dime2.get_nccl_id`), generalized
+    from a single leader->followers broadcast (jaxpp's case: exactly one
+    process per side of a stage boundary) to root->all-domain-members. It
+    doesn't require every process to be mutually reachable via a whole-job
+    collective the way `_allgather_uid`'s `process_allgather`/`jax.devices()`
+    paths do -- only the processes in this one EP domain need to agree on
+    the key. That's what makes this safe to use when the ambient mesh (and
+    therefore `jax.devices()`) has been narrowed to a subset of the job's
+    devices, e.g. one JaxPP pipeline stage's local process group: those
+    other paths hard-require `world_size`/`mesh` device count to equal the
+    *entire* distributed job (see `_allgather_uid`'s size-mismatch checks),
+    which is never true for a narrowed, per-stage mesh.
+
+    Rank numbering (`root_rank`, `rank_within_group`, `EpConfig.rank`/
+    `world_size`) is untouched by this function on purpose: it stays exactly
+    whatever `_ep_domain_for_rank`/the caller already computed, so this is a
+    transport-only change, not a semantic one.
+
+    Uses a static, `root_rank`-only key (no call counter): `ep_bootstrap` is
+    normally called exactly once per process (guarded by the
+    `_TE_EP_STATE is not None` check in maxtext's te_ep_init.py), so there's
+    no staleness risk in the common case. A counter would need to be
+    identical across the root and every follower in the domain to produce
+    matching keys, but a plain per-process Python global can't guarantee
+    that (different processes may have made a different number of prior
+    calls) -- so it would risk mismatched keys instead of preventing
+    staleness. `reset_te_ep_state_for_test` already documents that
+    re-bootstrapping doesn't tear down the underlying NCCL state, i.e. test
+    re-init isn't fully clean today regardless of this function.
+    """
+    from jax._src.distributed import global_state  # pylint: disable=import-outside-toplevel
+
+    client = global_state.client
+    if client is None:
+        raise RuntimeError(
+            "_publish_and_fetch_domain_uid requires a distributed JAX runtime "
+            "(jax.distributed.initialize() must have been called)."
+        )
+    key = f"te_ep_domain_uid:{root_rank}"
+    if is_color_root:
+        client.key_value_set_bytes(key, uid_bytes)
+        result = uid_bytes
+    else:
+        TIMEOUT = 120_000  # ms; matches jaxpp's own get_nccl_id default order of magnitude
+        result = bytes(client.blocking_key_value_get_bytes(key, TIMEOUT))
+    if len(result) != uid_size:
+        raise RuntimeError(
+            f"_publish_and_fetch_domain_uid: expected {uid_size} bytes, got {len(result)} "
+            f"(key={key!r})."
+        )
+    return result
+
+
 # ── Bootstrap ────────────────────────────────────────────────────────────────
 
 
@@ -144,6 +208,7 @@ def ep_bootstrap(
     max_token_dtype=jnp.bfloat16,
     max_num_sms=0,
     drop_on_overflow=False,
+    scope_uid_exchange_to_mesh=False,
 ):
     """Initialize the EP communicator. Call once per process before any EP op.
 
@@ -165,6 +230,17 @@ def ep_bootstrap(
         drop_on_overflow: Drop tokens exceeding recv_capacity_per_rank instead of
             trapping on overflow. Dropped tokens are still counted in
             total_recv_tokens, so callers can detect overflow from it.
+        scope_uid_exchange_to_mesh: NOTE(jaxpp) When False (default, matches
+            all existing behavior exactly), the NCCL unique-ID exchange uses
+            `_allgather_uid`, which requires `world_size`/the active mesh's
+            device count to equal the *entire* distributed JAX job -- true
+            for ordinary flat-SPMD runs, never true when the active mesh has
+            been narrowed to one JaxPP pipeline stage's local process group.
+            When True, uses `_publish_and_fetch_domain_uid` instead: a
+            point-to-point KV-store rendezvous scoped to just this EP
+            domain's processes (see that function's docstring), which works
+            correctly for a narrowed `world_size`/mesh. Rank numbering is
+            identical either way; this only changes the UID transport.
     """
     if jnp.dtype(max_token_dtype) != jnp.bfloat16:
         raise NotImplementedError(
@@ -232,9 +308,12 @@ def ep_bootstrap(
     else:
         uid_bytes = bytes(UID_SIZE)
 
-    uid_arr = jnp.frombuffer(uid_bytes, dtype=jnp.uint8)
-    all_uids = _allgather_uid(uid_arr, world_size, UID_SIZE)
-    uid_bytes = bytes(np.asarray(all_uids[root_rank]).tolist())
+    if scope_uid_exchange_to_mesh:
+        uid_bytes = _publish_and_fetch_domain_uid(uid_bytes, is_color_root, root_rank, UID_SIZE)
+    else:
+        uid_arr = jnp.frombuffer(uid_bytes, dtype=jnp.uint8)
+        all_uids = _allgather_uid(uid_arr, world_size, UID_SIZE)
+        uid_bytes = bytes(np.asarray(all_uids[root_rank]).tolist())
 
     # Eager NCCL init while ranks are barrier-synced by the UID broadcast above.
     transformer_engine_jax.set_ep_bootstrap_params(

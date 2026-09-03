@@ -498,6 +498,20 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
   Must be called before ``setup_train_loop`` — model creation traces
   ``moe.py`` which dispatches into ``ep_dispatch``. Idempotent for matching
   ``config_key``; raises on shape/resource mismatch.
+
+  NOTE(jaxpp): Under ``config.use_jaxpp``, ``mesh`` must already be narrowed
+  to this process's own pipeline stage (``mpmd_mesh.lowering_mesh()`` --
+  see ``train_utils.setup_train_loop``, which calls this function with that
+  narrowed mesh, positioned after MpmdMesh construction and before model
+  creation). ``world_size`` below is derived from ``mesh``'s own device
+  count rather than the whole job's, so each pipeline stage bootstraps its
+  own independent EP communicator scoped to just its local processes,
+  instead of one communicator (wrongly) spanning every stage. See
+  ``ep_bootstrap``'s ``scope_uid_exchange_to_mesh`` docstring
+  (transformer_engine/jax/ep.py) for why the UID exchange also needs a
+  jaxpp-aware code path, not just a smaller `world_size` -- and
+  JAXPP_TE_EP_NOTES.md at the repo root for the full investigation this is
+  based on.
   """
   from maxtext.common.common_types import DecoderBlockType  # pylint: disable=import-outside-toplevel
 
@@ -512,8 +526,8 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
     )
   if getattr(config, "decoder_block", None) != DecoderBlockType.DEEPSEEK:
     raise ValueError("use_te_ep=True currently only supports decoder_block=DEEPSEEK.")
-  if bool(getattr(config, "using_pipeline_parallelism", False)):
-    raise ValueError("use_te_ep=True does not support pipeline parallelism.")
+  if bool(getattr(config, "using_pipeline_parallelism", False)) and not bool(getattr(config, "use_jaxpp", False)):
+    raise ValueError("use_te_ep=True does not support MaxText-native pipeline parallelism (only use_jaxpp).")
   if bool(getattr(config, "use_batch_split_schedule", False)):
     raise ValueError("use_te_ep=True does not support use_batch_split_schedule.")
   if getattr(config, "engram_layers", None):
@@ -530,12 +544,18 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
       )
     return _TE_EP_STATE
 
-  world_size = jax.process_count()
+  # world_size is the *mesh's* device count, not necessarily the whole job's:
+  # under use_jaxpp, `mesh` (and therefore `candidate.mesh`) is already
+  # narrowed to this process's own pipeline stage, so this naturally becomes
+  # the stage-local world size. For non-jaxpp callers, mesh still spans the
+  # whole job, so this is unchanged from the previous `jax.process_count()`.
+  world_size = int(candidate.mesh.devices.size)
   rank = jax.process_index()
   if world_size != candidate.expected_world_size:
     raise ValueError(
-        "TE EP v1 expects one JAX process per active expert-view mesh slot. "
-        f"process_count={world_size}, expected={candidate.expected_world_size}, "
+        "TE EP v1 expects one JAX process per active expert-view mesh slot "
+        "(within this pipeline stage, if use_jaxpp). "
+        f"mesh_device_count={world_size}, expected={candidate.expected_world_size}, "
         f"outer_axes={candidate.outer_axes}, ep_size={candidate.ep_size}, "
         f"expert_tensor_size={candidate.tensor_size}, dense_tensor_size={candidate.dense_tensor_size}."
     )
@@ -557,6 +577,7 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
         recv_capacity_per_rank=candidate.recv_capacity_per_rank,
         hidden_dim=candidate.hidden_dim,
         max_num_sms=candidate.max_num_sms,
+        scope_uid_exchange_to_mesh=bool(getattr(config, "use_jaxpp", False)),
         drop_on_overflow=candidate.drop_on_overflow,
     )
 

@@ -20,7 +20,6 @@ from functools import partial
 
 import jax
 import functools
-from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 from maxtext.common import checkpointing
 from maxtext.common.data_loader import create_dataloader
@@ -266,39 +265,45 @@ def setup_train_loop(config, recorder, devices=None):
   with maybe_record_goodput(recorder, GoodputEvent.TPU_INIT):
     is_training = True
     init_rng = jax.random.PRNGKey(config.init_weights_seed)
-    if config.pure_nnx:
-      # Create abstract NNX model.
-      raise NotImplementedError("Pure NNX support has not been implemented yet.")
-    else:
-      model = model_creation_utils.from_config(config, devices)
-    mesh = model.mesh
 
-    # Construct MpmdMesh here, before state/data setup, and narrow `mesh` +
-    # model.mesh to mpmd_mesh.lowering_mesh() ("the local process's MPMD
-    # group mesh" per MpmdMesh's own docstring) for the rest of this
-    # function. This must happen before setup_training_state below: that's
-    # what makes get_abstract_state build state_mesh_shardings against the
-    # narrowed mesh, so state's own sharding annotations agree with the
-    # ambient jax.set_mesh() context used later when compiling/tracing
-    # (mismatched full-vs-narrow meshes there raise "use_abstract_mesh
-    # cannot change the size of the mesh" -- confirmed via jobs 5966677/
-    # 5966731, reproducing regardless of PP degree). Matches the reference
-    # jaxpp_dev/maxtext branch's maxtext_utils.setup_initial_state, which
-    # narrows `mesh` from maybe_mpmd_mesh.lowering_mesh() before calling
-    # get_abstract_state.
+    # Build the mesh before model creation (rather than letting from_config
+    # build its own internally) so MpmdMesh construction and TE_EP bootstrap
+    # can both happen first -- both need to run before any model tracing:
+    # - MpmdMesh must narrow `mesh` to mpmd_mesh.lowering_mesh() ("the local
+    #   process's MPMD group mesh" per MpmdMesh's own docstring) before
+    #   get_abstract_state builds state_mesh_shardings below, so state's own
+    #   sharding annotations agree with the ambient jax.set_mesh() context
+    #   used later when compiling/tracing (mismatched full-vs-narrow meshes
+    #   there raise "use_abstract_mesh cannot change the size of the mesh"
+    #   -- confirmed via jobs 5966677/5966731, reproducing regardless of PP
+    #   degree). Matches the reference jaxpp_dev/maxtext branch's
+    #   maxtext_utils.setup_initial_state, which narrows `mesh` from
+    #   maybe_mpmd_mesh.lowering_mesh() before calling get_abstract_state.
+    # - TE_EP's NCCL communicator bootstrap must run before model creation,
+    #   because model creation traces moe.py which calls ep_dispatch (was
+    #   previously done in train.py before calling this function at all;
+    #   moved here so it can see the narrowed mesh under use_jaxpp).
+    # Passing `mesh=` to from_config below then makes model.mesh correct
+    # from construction, without needing to mutate/clone the model after.
+    mesh = maxtext_utils.get_mesh_from_config(config, devices)
+
     mpmd_mesh = None
     if config.use_jaxpp:
       import jaxpp.api as jaxpp  # pylint: disable=import-outside-toplevel
 
       mpmd_mesh = jaxpp.MpmdMesh(mesh, "stage")
       mesh = mpmd_mesh.lowering_mesh()
-      # model is a frozen flax.linen.Module (unless config.enable_nnx), so
-      # plain attribute mutation isn't allowed outside setup()/compact --
-      # use clone() to get an updated instance instead.
-      if isinstance(model, nn.Module):
-        model = model.clone(mesh=mesh)
-      else:
-        model.mesh = mesh
+
+    if config.use_te_ep:
+      from maxtext.layers import te_ep_init  # pylint: disable=import-outside-toplevel
+
+      te_ep_init.init_te_ep_for_maxtext(config, mesh)
+
+    if config.pure_nnx:
+      # Create abstract NNX model.
+      raise NotImplementedError("Pure NNX support has not been implemented yet.")
+    else:
+      model = model_creation_utils.from_config(config, devices, mesh=mesh)
 
     learning_rate_schedule, tx = create_training_optimizer(config, model)
     if config.pure_nnx:
