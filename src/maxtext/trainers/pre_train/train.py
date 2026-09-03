@@ -601,6 +601,24 @@ def train_loop(config, recorder, state=None):
 
     mpmd_mesh = jaxpp.MpmdMesh(mesh, "stage")
     mesh = mpmd_mesh.lowering_mesh()
+    # Layers built by model creation (before this point) captured mesh at
+    # construction time (`self.mesh = mesh` in each layer's __init__, e.g.
+    # moe.py's MoeBlock) -- decoders.py re-instantiates layers fresh on every
+    # forward trace using whatever `mesh` is threaded through model.mesh at
+    # that point, so updating it here corrects what they see. Without this,
+    # layers keep the pre-lowering physical mesh (full "stage" size) while
+    # the ambient jax.set_mesh(mesh) context below correctly narrows "stage"
+    # to this rank's local view -- causing shard_map calls that pass
+    # mesh=self.mesh (e.g. moe.py's ring_of_experts dispatch) to fail with
+    # "context mesh ... should match the mesh passed to shard_map". Matches
+    # the jaxpp reference's jit_train_step, which does the same reassignment.
+    # model is a frozen flax.linen.Module (unless config.enable_nnx), so
+    # plain attribute mutation isn't allowed outside setup()/compact --
+    # use clone() to get an updated instance instead.
+    if isinstance(model, nn.Module):
+      model = model.clone(mesh=mesh)
+    else:
+      model.mesh = mesh
 
   with jax.set_mesh(mesh), mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
     p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
