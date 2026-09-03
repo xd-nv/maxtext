@@ -20,6 +20,7 @@ from functools import partial
 
 import jax
 import functools
+from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 from maxtext.common import checkpointing
 from maxtext.common.data_loader import create_dataloader
@@ -271,6 +272,34 @@ def setup_train_loop(config, recorder, devices=None):
     else:
       model = model_creation_utils.from_config(config, devices)
     mesh = model.mesh
+
+    # Construct MpmdMesh here, before state/data setup, and narrow `mesh` +
+    # model.mesh to mpmd_mesh.lowering_mesh() ("the local process's MPMD
+    # group mesh" per MpmdMesh's own docstring) for the rest of this
+    # function. This must happen before setup_training_state below: that's
+    # what makes get_abstract_state build state_mesh_shardings against the
+    # narrowed mesh, so state's own sharding annotations agree with the
+    # ambient jax.set_mesh() context used later when compiling/tracing
+    # (mismatched full-vs-narrow meshes there raise "use_abstract_mesh
+    # cannot change the size of the mesh" -- confirmed via jobs 5966677/
+    # 5966731, reproducing regardless of PP degree). Matches the reference
+    # jaxpp_dev/maxtext branch's maxtext_utils.setup_initial_state, which
+    # narrows `mesh` from maybe_mpmd_mesh.lowering_mesh() before calling
+    # get_abstract_state.
+    mpmd_mesh = None
+    if config.use_jaxpp:
+      import jaxpp.api as jaxpp  # pylint: disable=import-outside-toplevel
+
+      mpmd_mesh = jaxpp.MpmdMesh(mesh, "stage")
+      mesh = mpmd_mesh.lowering_mesh()
+      # model is a frozen flax.linen.Module (unless config.enable_nnx), so
+      # plain attribute mutation isn't allowed outside setup()/compact --
+      # use clone() to get an updated instance instead.
+      if isinstance(model, nn.Module):
+        model = model.clone(mesh=mesh)
+      else:
+        model.mesh = mesh
+
     learning_rate_schedule, tx = create_training_optimizer(config, model)
     if config.pure_nnx:
       # NNX has a different function to init the training state.
@@ -389,6 +418,7 @@ def setup_train_loop(config, recorder, devices=None):
       rampup_manager,
       eval_data_iterator,
       state,
+      mpmd_mesh,
   )
 
 

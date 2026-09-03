@@ -71,6 +71,7 @@ def train_loop(config, recorder, state=None):
       _,
       eval_data_iterator,
       state,
+      _,
   ) = train_utils.setup_train_loop(config, recorder)
 
   params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
