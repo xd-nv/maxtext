@@ -1,0 +1,111 @@
+# Running `use_te_ep` + `use_jaxpp` together
+
+This is a practical how-to for running DeepSeek V3 671B with TE's
+NCCL-based expert-parallel MoE (`use_te_ep`) together with JaxPP pipeline
+parallelism (`use_jaxpp`) on this branch. For the full investigation
+history, root causes, and what was tried and rejected along the way, see
+`JAXPP_TE_EP_NOTES.md` (sections 6a-7o) in this repo.
+
+## Status
+
+Validated end-to-end on 8 EOS nodes (H100, 64 GPUs): training runs with a
+correct, monotonically decreasing loss curve and steady-state throughput
+of ~40 TFLOP/s/device on a reduced (8-layer) smoke config. The last
+configured training step hangs on the two pipeline endpoint ranks -- see
+[Known limitations](#known-limitations) below. Everything short of that is
+working and numerically sane.
+
+This has **not** been run at full scale (61 layers, production
+batch/microbatch counts) or validated against a `scan_layers=True`
+numerical reference. Treat it as "architecturally working, smoke-tested,"
+not "production-ready."
+
+## What's involved
+
+Three repos/pieces, all required together:
+
+1. **This repo**, branch `te-pr3429-nested-gemm-0826_jaxpp` -- has the
+   JaxPP port plus the `use_te_ep`-under-jaxpp fixes (mesh scoping,
+   `scan_layers` guard relaxation, the `spmd_to_mpmd_reshard` bypass, GEMM
+   quantization, metric-logging fixes).
+2. **`src/maxtext/te_overlay_jaxpp/`** (checked into this repo) -- a
+   Python-source-only overlay for `transformer_engine`, carrying a patch
+   to `ep_bootstrap`'s NCCL UID exchange (`scope_uid_exchange_to_mesh`) so
+   it works when the ambient mesh has been narrowed to one pipeline
+   stage's devices, instead of assuming it always spans the whole job.
+   Must be passed to the launcher via `--te-overlay-dir`; it's copied over
+   `/opt/transformer-engine/transformer_engine/` inside the container at
+   job start (see `maxtext-launcher/launcher.py`'s `te_overlay_setup`).
+3. **`maxtext-launcher`**, branch `add-jaxpp-pp-support` -- has the JaxPP
+   CLI/config knobs and the validated smoke-test config,
+   `configs/models/deepseek-v3-671b-pp8-15layer-smoke-teep.yaml`.
+
+## How to run the validated smoke test
+
+```bash
+cd /lustre/fsw/coreai_devtech_all/<you>/jax/maxtext-launcher   # or wherever it's checked out
+python3 launcher.py deepseek-v3-671b-pp8-15layer-smoke-teep --cluster eos --tag <your-tag> \
+  --te-overlay-dir /path/to/maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp
+```
+
+This launches an 8-node (64-GPU) job: `EP=8` (ici) x `PP=8` (dcn), 8
+decoder layers (3 dense + 5 MoE), `steps: 8`. Expect steps 0-6 to complete
+normally with real, decreasing loss; step 7 will hang on two ranks (see
+below) -- either let it run and manually cancel once you've read the
+metrics you need, or reduce `steps` if you don't need the extra data
+points. See that config file's own header comments for the reasoning
+behind each setting -- several are load-bearing, not arbitrary (e.g.
+`routed_bias: false`, `te_gmm_quantization: te_no_quant`).
+
+### Container and container-overlay pairing matters
+
+The smoke config's `container:` (a `.sqsh` file, not the gitlab image used
+by other DSv3 configs) is specifically the one whose baked-in
+`transformer_engine` matches `te_overlay_jaxpp`'s baseline. Don't swap the
+container without checking the overlay is still compatible --
+mismatched pairings crash on unrelated missing symbols (see
+`JAXPP_TE_EP_NOTES.md` 6d for a concrete example of what goes wrong).
+
+## Known limitations
+
+1. **Last-step hang on pipeline endpoint ranks.** Root-caused via a live
+   `py-spy` stack dump (`JAXPP_TE_EP_NOTES.md` 7m/7n) to a stuck
+   device-side async computation for one metric value on the two pipeline
+   endpoint stages (rank 0 and the last rank) -- not a crash, not a
+   training-correctness issue (loss is already correct and decreasing by
+   the time it happens). Looks like a JaxPP scheduling edge case for
+   terminal-iteration draining at pipeline boundaries; not something
+   fixable from this integration layer. Workaround: run a couple of extra
+   steps beyond what you need and don't wait for/depend on the final one.
+
+2. **`scan_layers=False` + `use_te_ep` numerical correctness is inferred,
+   not verified.** The `scan_layers=True` requirement was relaxed to a
+   warning based on tracing the code history (the original race condition
+   it guarded against was structurally eliminated by a later TE API
+   migration -- see `JAXPP_TE_EP_NOTES.md` 6h/6i) but no side-by-side loss
+   comparison against a `scan_layers=True` reference has been run.
+
+3. **The `spmd_to_mpmd_reshard` bypass (`_local_state_to_mpmd_reshard` in
+   `train.py`) relies on an unverified assumption for multi-stage-owned
+   state leaves** (e.g. a tied embedding/LM-head table): that every owning
+   stage's independently-initialized copy is already numerically
+   identical, so no real cross-process data movement is needed. This
+   holds by construction for model parameters (deterministic init from a
+   shared seed). For the equivalent per-step batch/rng reshard, the same
+   bypass is used but the assumption is weaker and unverified for
+   non-synthetic datasets -- see the docstring and the inline comment at
+   that call site in `train.py` before reusing it for a real-data run.
+
+4. Not tested at full model scale, only the reduced 8-layer smoke config.
+
+## Where to look for more detail
+
+- `JAXPP_TE_EP_NOTES.md` (this repo) -- the full chronological
+  investigation, including every dead end, wrong hypothesis, and the
+  reasoning behind each fix. Sections 6a-6z cover getting past mesh
+  scoping, the compile-time OOM, and the GEMM/quantization issue; 7a-7o
+  cover the resharding bypass and the metric-logging/hang investigation.
+- `src/maxtext/layers/te_ep_init.py::init_te_ep_for_maxtext` -- the
+  `scan_layers` guard and its NOTE(jaxpp) docstring block.
+- `src/maxtext/trainers/pre_train/train.py::_local_state_to_mpmd_reshard`
+  -- the reshard bypass, with its own detailed docstring.
