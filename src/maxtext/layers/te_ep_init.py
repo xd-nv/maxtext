@@ -517,12 +517,36 @@ def init_te_ep_for_maxtext(config: Any, mesh: jax.sharding.Mesh) -> TeEpState:
 
   global _TE_EP_STATE
 
-  # Guard: only the normal scanned DeepSeek MoE path is wired for
-  # te_ep_layer_idx threading. Loosen guards as other paths are added.
+  # NOTE(jaxpp): scan_layers=False (required by JaxPP, which pipelines
+  # unrolled per-stage layers rather than scanning) used to be hard-rejected
+  # here. That guard (added in 980a5337) protected against a real bug fixed
+  # in 7e05a9aa: all scan iterations shared one process-level EpHandle, and
+  # XLA's Latency Hiding Scheduler could overlap ep_dispatch of layer i+1
+  # with ep_combine of layer i, corrupting the shared handle -> silent NaN
+  # corruption. The fix at the time was per-layer EpHandles selected via
+  # lax.switch(te_ep_layer_idx, ...).
+  #
+  # That entire EpHandle/lax.switch mechanism was deleted in 62820f14
+  # ("Adapt TE EP path to PR3036 API"): the newer TE EP API has no
+  # process-shared handle object left to alias. tex.ep_prepare() now
+  # produces a fresh `handle_mem` value on every ep_dispatch call, threaded
+  # through the custom_vjp primal/residual like any other traced JAX value
+  # -- there is no longer any state shared across layers for XLA's scheduler
+  # to race on. te_ep_layer_idx is unused dead code from that era. See
+  # JAXPP_TE_EP_NOTES.md section 6 for the full investigation.
+  #
+  # We can't rule out some other reason to need scan_layers from the C++/CUDA
+  # side of TE, so this is not re-tightened, but relaxed to a warning rather
+  # than silently dropped, so any unexpected regression is easy to trace back
+  # here.
   if not bool(getattr(config, "scan_layers", False)):
-    raise ValueError(
-        "use_te_ep=True requires scan_layers=True. Unrolled MoE stacks need "
-        "separate per-layer handle plumbing that is not yet implemented."
+    max_logging.log(
+        "use_te_ep=True with scan_layers=False: the historical justification "
+        "for requiring scan_layers=True (shared EpHandle aliasing across scan "
+        "iterations) no longer applies -- that handle mechanism was removed "
+        "in the PR3036 TE EP API migration. Proceeding, but this combination "
+        "has not been numerically validated against a scan_layers=True "
+        "reference; see JAXPP_TE_EP_NOTES.md section 6."
     )
   if getattr(config, "decoder_block", None) != DecoderBlockType.DEEPSEEK:
     raise ValueError("use_te_ep=True currently only supports decoder_block=DEEPSEEK.")

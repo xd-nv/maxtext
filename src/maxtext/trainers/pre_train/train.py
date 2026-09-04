@@ -451,7 +451,19 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "learning/mtp_loss": mtp_loss,
       "learning/total_weights": total_weights,
   }
-  if config.use_te_ep:
+  # NOTE(jaxpp): calculate_te_ep_recv_metrics concatenates a
+  # te_ep_total_recv_tokens intermediate sown once per MoE layer
+  # (moe.py::te_ep_wrapper) -- under use_jaxpp, different layers live on
+  # different pipeline stages, and this concatenate runs in JaxPP's
+  # "after loop" (post-scan) portion of the traced program, which requires
+  # every value combined there to be produced identically on every stage
+  # ("replicateable"). A cross-stage concatenate isn't, so this trips
+  # `AssertionError: After loop computation is not replicateable`
+  # (jaxpp/core.py::process_primitive). This metric is diagnostics-only
+  # (recv-capacity overflow monitoring, not consumed by the loss/gradient),
+  # so it's simply skipped under jaxpp rather than routed through a proper
+  # cross-stage reduction -- see JAXPP_TE_EP_NOTES.md section 6j.
+  if config.use_te_ep and not config.use_jaxpp:
     # Import lazily so non-TE runs do not depend on Transformer Engine.
     from maxtext.layers import te_ep_init  # pylint: disable=import-outside-toplevel
 
@@ -543,6 +555,109 @@ def eval_step(model, config, state, data, dropout_rng):
   return metrics
 
 
+def _local_state_to_mpmd_reshard(mpmd_mesh, local_state, mpmd_shardings):
+  """NOTE(jaxpp): surgical bypass for jaxpp.spmd_to_mpmd_reshard's initial-state call.
+
+  jaxpp.spmd_to_mpmd_reshard (jaxpp/array.py) assumes its input is a
+  genuinely SPMD-full-mesh-resident pytree (every process holds a shard of
+  every leaf, per the normal MaxText/JaxPP flow where state is built before
+  MpmdMesh narrows the mesh). Our `state` is instead built directly against
+  mpmd_mesh.lowering_mesh() (a1a382ea, required so use_te_ep's
+  p_train_step.compile() doesn't hit "use_abstract_mesh cannot change the
+  size of the mesh") -- so each process's `local_state` leaves are only
+  ever physically resident on this process's own 8 stage-local devices,
+  never the full mesh. Calling the generic reshard's
+  `jax.jit(_id, out_shardings=full_mesh_shardings)(*spmd_values)` on that
+  input fails ("Received incompatible devices for jitted computation"),
+  because JAX's Explicit sharding mode (shard_mode=explicit) does not
+  silently reinterpret an array committed to one concrete mesh as living
+  within a larger one -- that requires real data movement, which the
+  generic path assumes is unnecessary work it can skip via a reshard-jit,
+  not something it can perform from a narrowed starting point.
+
+  This bypasses that assumption directly, constructing jaxpp.MpmdArray
+  objects from each leaf's ALREADY-local data, mirroring exactly what
+  jaxpp.array._spmd_to_mpmd_reshard's own per-array branches do once they
+  already have a per-mpmd-idx local slice in hand (see its `else:` branch,
+  `MpmdArray(partially_addressable_arrays=[new_arr], mpmd_sharding=...)`)
+  -- the difference is we already have that per-stage-local slice (it's
+  simply what `local_state` already is), so no jax.jit/slice_p reshard is
+  needed to produce it.
+
+  Correctness assumption (NOT verified beyond code-reading -- see
+  JAXPP_TE_EP_NOTES.md section 6z): for a leaf whose MpmdSharding.mesh_ids
+  spans more than one pipeline stage (e.g. the embedding table, needed by
+  both the first stage's embedding lookup and the last stage's LM head),
+  jaxpp.MpmdArray's own docstring states such leaves are "replicated
+  across those groups" (jaxpp/array.py::MpmdArray docstring) rather than
+  sharded across them -- i.e. every owning stage is expected to hold its
+  own complete, numerically-identical copy. Model parameter initialization
+  is deterministic (same init_weights_seed, same model-construction code
+  traced independently by every process before any pipeline-stage
+  clustering happens), so every process's local_state should already hold
+  numerically-correct data for any leaf it owns, INCLUDING leaves owned by
+  multiple stages -- no cross-process data movement should actually be
+  required. This has not been empirically validated (e.g. by comparing a
+  resulting loss curve against a scan_layers=True/non-jaxpp reference); if
+  this assumption is wrong for some leaf (e.g. a leaf whose "replication"
+  is not actually independently-deterministic across stages), this
+  function will silently produce wrong values for that leaf rather than
+  raising an error.
+  """
+  import jaxpp.api as jaxpp  # pylint: disable=import-outside-toplevel
+
+  local_flat, tree_def = jax.tree.flatten_with_path(local_state)
+  mpmd_shardings_flat, sharding_tree_def = jax.tree.flatten(mpmd_shardings)
+  assert tree_def == sharding_tree_def, (tree_def, sharding_tree_def)
+
+  from jaxpp.types import MpmdSharding  # pylint: disable=import-outside-toplevel
+
+  my_idx = mpmd_mesh.my_mpmd_axis_index
+  results = []
+  for (_, arr), dsh in zip(local_flat, mpmd_shardings_flat, strict=True):
+    # NOTE(jaxpp): jaxpp.array.spmd_to_mpmd_reshard defaults "unused" arrays
+    # (len(dsh.mesh_ids) == 0) to mpmd rank 0 by constructing a *new*
+    # MpmdSharding with mesh_ids={0} -- reusing `dsh` as-is (still carrying
+    # the original empty mesh_ids) instead of this corrected sharding was a
+    # real bug caught by job 5970696: MpmdArray.__init__'s own validation
+    # re-derives mpmd_idx from the array's mesh and checks it's `in`
+    # mpmd_sharding.mesh_ids, which fails against an empty frozenset even
+    # for the rank the array is meant to default to.
+    if len(dsh.mesh_ids) == 0:
+      dsh = MpmdSharding(
+          mpmd_mesh=dsh.mpmd_mesh, mesh_ids={0}, spec=dsh.spec, memory_kind=dsh.memory_kind
+      )
+    # NOTE(jaxpp): jaxpp.array.get_named_sharding (called inside
+    # MpmdArray.__init__) asserts arr.sharding is a NamedSharding. State
+    # leaves always are (built via Flax/NNX under jax.set_mesh(narrow
+    # mesh)), but a leaf like `nextrng` -- a bare
+    # jax.jit(jax.random.fold_in)(init_rng, step) call with no explicit
+    # out_shardings -- isn't (job 5970741: "AssertionError" inside
+    # get_named_sharding). Commit it onto this process's own narrowed mesh
+    # first; it's a fresh, tiny, per-process value with no genuine
+    # cross-process state to reconcile, so a plain local device_put (no
+    # mesh-crossing reshard) is sufficient and doesn't hit the narrowed-vs-
+    # full-mesh issues this whole function exists to work around.
+    if not isinstance(arr.sharding, jax.sharding.NamedSharding):
+      arr = jax.device_put(
+          arr, jax.sharding.NamedSharding(mpmd_mesh.lowering_mesh(), jax.sharding.PartitionSpec())
+      )
+    if my_idx in dsh.mesh_ids:
+      results.append(
+          jaxpp.MpmdArray(partially_addressable_arrays=[arr], mpmd_sharding=dsh)
+      )
+    else:
+      results.append(
+          jaxpp.MpmdArray(
+              partially_addressable_arrays=[],
+              mpmd_sharding=dsh,
+              shape=arr.shape,
+              dtype=arr.dtype,
+          )
+      )
+  return jax.tree.unflatten(tree_def, results)
+
+
 def train_loop(config, recorder, state=None):
   """Main Training loop."""
   # Initialize HybridEP buffer manager BEFORE setup_train_loop, because model creation
@@ -620,8 +735,6 @@ def train_loop(config, recorder, state=None):
       data_sharding = sharding.get_input_data_sharding(config, mesh)
       shaped_batch = maxtext_utils.get_shaped_batch(config, data_sharding=data_sharding)
       p_train_step = p_train_step.compile(state, shaped_batch, init_rng)
-      args_mpmd_shardings, _ = p_train_step.in_shardings
-      state = jaxpp.spmd_to_mpmd_reshard(mpmd_mesh, state, args_mpmd_shardings[0])
     else:
       shaped_batch = maxtext_utils.get_shaped_batch(config)
       if config.shard_optimizer_over_data:
@@ -631,6 +744,21 @@ def train_loop(config, recorder, state=None):
         compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
         compiled_stats = compiled.memory_analysis()
         max_utils.print_compiled_memory_stats(compiled_stats)
+
+  if config.use_jaxpp:
+    # NOTE(jaxpp): jaxpp.spmd_to_mpmd_reshard doesn't work here -- `state` is
+    # built directly against mpmd_mesh.lowering_mesh() (a1a382ea, required
+    # for use_te_ep's p_train_step.compile() to work at all), so it's never
+    # genuinely SPMD-full-mesh-resident the way that function assumes; no
+    # amount of jax.set_mesh context juggling around the call fixes that
+    # (tried both narrowed and full-mesh contexts, see JAXPP_TE_EP_NOTES.md
+    # 6w-6y for the failed attempts and why). _local_state_to_mpmd_reshard
+    # bypasses the generic reshard and constructs MpmdArrays directly from
+    # each leaf's already-local data -- see its docstring for the full
+    # reasoning and the correctness assumption this relies on (not yet
+    # empirically validated -- JAXPP_TE_EP_NOTES.md 6z).
+    args_mpmd_shardings, _ = p_train_step.in_shardings
+    state = _local_state_to_mpmd_reshard(mpmd_mesh, state, args_mpmd_shardings[0])
 
   start_step = get_first_step(model, state)  # this is the start_step for training
   prof = profiler.Profiler(config, offset_step=start_step)
@@ -643,14 +771,42 @@ def train_loop(config, recorder, state=None):
   try:
     last_step_completion = datetime.datetime.now()
     for step in np.arange(start_step, config.steps):
-      prof.maybe_activate_profiler(step, state)
+      # NOTE(jaxpp): same reasoning as maybe_deactivate_profiler below --
+      # profiler.activate() has the identical jax.block_until_ready(state)
+      # pattern; didn't manifest as a hang at activation time in job
+      # 5971015, but the risk is structurally identical, so avoid it here
+      # too rather than relying on it happening not to trigger.
+      prof.maybe_activate_profiler(step, None if config.use_jaxpp else state)
 
       with jax.profiler.StepTraceAnnotation("train", step_num=step):
         example_batch = data_loader.load_next_batch(rampup_manager=rampup_manager)
         # pylint: disable=not-callable
         nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
         if config.use_jaxpp:
-          example_batch, nextrng = jaxpp.spmd_to_mpmd_reshard(
+          # NOTE(jaxpp): same narrowed-mesh issue as the initial state
+          # reshard (see _local_state_to_mpmd_reshard and 7a/7b in
+          # JAXPP_TE_EP_NOTES.md) -- example_batch/nextrng are also only
+          # ever physically resident on this process's own narrowed
+          # devices, not genuinely SPMD-full-mesh, because `mesh` is
+          # narrowed for the whole train_loop under use_te_ep (a1a382ea).
+          # Confirmed by job 5970642: identical "Received incompatible
+          # devices" failure, now on example_batch (int32[64,512]) instead
+          # of a state leaf.
+          #
+          # Weaker assumption here than for `state`: params are
+          # deterministically initialized (same seed, same trace, every
+          # process), so a multi-stage-owned param leaf is provably
+          # identical everywhere. example_batch is loaded fresh every step
+          # (data_loader.load_next_batch); for config.dataset_type ==
+          # "synthetic" (this smoke test), the synthetic generator should
+          # also be deterministic per step/process, so the same reasoning
+          # plausibly holds -- but this has NOT been verified, and does NOT
+          # obviously generalize to real (non-synthetic) datasets, where
+          # different processes may load genuinely different data and a
+          # leaf needed by multiple stages could legitimately need real
+          # cross-process movement. Do not reuse this bypass for a
+          # non-synthetic-data run without re-examining this assumption.
+          example_batch, nextrng = _local_state_to_mpmd_reshard(
               mpmd_mesh, (example_batch, nextrng), p_train_step.in_shardings[0][1:]
           )
         with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
@@ -658,6 +814,22 @@ def train_loop(config, recorder, state=None):
             if config.shard_optimizer_over_data and not config.use_jaxpp:
               state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
             state, metrics = p_train_step(state, example_batch, nextrng)
+        if config.use_jaxpp:
+          # NOTE(jaxpp): train_step's scalar_metrics (loss, total_weights,
+          # etc.) are only genuinely computed/addressable on whichever mpmd
+          # stage produces the final loss -- on every other stage's
+          # process, these leaves are MpmdArrays with no local data.
+          # metric_logger's log-formatting code (f"{scalars[...]}") assumes
+          # plain, locally-addressable values on every process (job
+          # 5970913: "AssertionError: Array is not partially addressable"
+          # from jaxpp.array.MpmdArray.__format__). max_utils.maybe_unwrap
+          # already exists for exactly this (unwraps to
+          # first_mpmd_replica, or 0 if this process doesn't have it) --
+          # apply it across the whole metrics pytree here rather than
+          # patching every individual format call in metric_logger.py.
+          metrics = jax.tree.map(
+              max_utils.maybe_unwrap, metrics, is_leaf=lambda x: type(x).__name__ == "MpmdArray"
+          )
 
       step_time_delta = datetime.datetime.now() - last_step_completion
       last_step_completion = datetime.datetime.now()
@@ -696,16 +868,66 @@ def train_loop(config, recorder, state=None):
           prof.deactivate()
           raise exceptions.StopTraining(f"Target loss {config.target_eval_loss=} is achieved.")
 
-      prof.maybe_deactivate_profiler(step, state)
+      # NOTE(jaxpp): profiler.deactivate()'s jax.block_until_ready(state)
+      # (gated by config.profile_cleanly) hung indefinitely on the two
+      # pipeline-endpoint ranks under use_jaxpp (job 5971015 -- steps 0-3
+      # completed with correct, decreasing loss; every rank reached step 3
+      # in lockstep, then non-endpoint ranks raced ahead to step 4 while
+      # ranks 0 and 7 stalled with no error for 30+ min). Plausible cause:
+      # `state` is a pytree of jaxpp.MpmdArray, not plain jax.Array, and at
+      # least one leaf (the embedding/lm_head table) is "replicated" across
+      # exactly those two endpoint stages (see
+      # _local_state_to_mpmd_reshard's docstring) -- jax.block_until_ready
+      # likely doesn't traverse/synchronize MpmdArray the way it does a
+      # normal pytree. This is a profiler-only diagnostic path, not the
+      # training computation itself (already proven correct via the real
+      # loss curve) -- pass state=None under jaxpp so deactivate() skips
+      # the blocking wait entirely, rather than fixing MpmdArray's
+      # block_until_ready semantics (out of scope for this investigation;
+      # see JAXPP_TE_EP_NOTES.md 7j).
+      prof.maybe_deactivate_profiler(step, None if config.use_jaxpp else state)
 
       if step == start_step:
         max_utils.print_mem_stats("After params initialized")
 
-      metric_logger.buffer_and_write_train_metrics(metrics, step, step_time_delta)
+      if config.use_jaxpp:
+        # NOTE(jaxpp): buffer_and_write_train_metrics deliberately writes the
+        # *previous* step's metrics while buffering the current step's, to
+        # overlap host-device sync latency with the next step's compute --
+        # the last step's metrics are therefore never materialized inside
+        # the loop, only in flush_metrics_and_cleanup() after it exits. Under
+        # jaxpp, that deferred materialization hung indefinitely, but only
+        # on the two pipeline endpoint ranks (0 and mpmd_dim-1), confirmed
+        # via py-spy (job 5971571): both ranks had fully completed all
+        # training steps and were blocked in
+        # flush_metrics_and_cleanup -> write_metrics -> jax.Array.__format__
+        # -> ._value on a metric value from the buffered last step. Likely
+        # tied to jaxpp's buffer-donation/reuse behavior once the loop (and
+        # its implicit "there's a next call coming" assumption) has ended.
+        # Skip the one-step-behind buffering under jaxpp entirely -- write
+        # every step's metrics immediately/synchronously, so nothing is ever
+        # deferred past the point where its underlying computation is
+        # guaranteed still valid. See JAXPP_TE_EP_NOTES.md section 7m.
+        metric_logger.record_train_metrics(metrics, step, step_time_delta.total_seconds())
+        metric_logger.write_metrics(metrics, step)
+      else:
+        metric_logger.buffer_and_write_train_metrics(metrics, step, step_time_delta)
 
-    if config.use_jaxpp:
-      assert mpmd_mesh is not None
-      state = jaxpp.mpmd_to_spmd_reshard(mpmd_mesh, state, state_mesh_shardings)
+    # NOTE(jaxpp): jaxpp.mpmd_to_spmd_reshard used to run here unconditionally,
+    # converting `state` back to a full-SPMD-mesh-sharded array to feed
+    # checkpoint-saving below. It's currently genuinely dead code: line 711
+    # unconditionally asserts `checkpoint_manager is None` whenever
+    # use_jaxpp=True ("Checkpointing is not supported together with JaxPP"),
+    # so `state`'s reshard result was never actually consumed --
+    # checkpointing.maybe_save_checkpoint(None, ...) below is a no-op
+    # regardless. Confirmed by job 5970982: this call hit the same
+    # narrowed-vs-full-mesh device-mismatch class as the other
+    # spmd_to_mpmd_reshard call sites (6w-7d), but in the reverse direction
+    # (mpmd_mesh.jax_mesh input -> narrowed output), which isn't covered by
+    # _local_state_to_mpmd_reshard's bypass (that only handles spmd->mpmd).
+    # Skip it rather than build/verify a second bypass for a call whose
+    # result is unused today; revisit once jaxpp checkpointing support
+    # actually lands (see JAXPP_TE_EP_NOTES.md 7h/7i).
 
     if config.save_checkpoint_on_completion:
       state_to_save = state if not config.use_dpo else _split_dpo_state(state)[0]
