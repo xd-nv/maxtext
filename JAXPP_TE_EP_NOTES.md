@@ -1433,3 +1433,49 @@ work (out of scope for this session per explicit user direction).
    for NaN) -- 6b's conclusion is code-evidence-based, not empirically
    validated yet.
 3. Once both land, re-test end to end.
+
+## 8. Scaling beyond the 8-layer smoke test
+
+Config: `deepseek-v3-671b-pp8-15layer-teep.yaml` (maxtext-launcher,
+`add-jaxpp-pp-support`) -- identical to the validated 8-layer smoke config
+except `base_num_decoder_layers: 15` (back to the original target: 3
+dense + 12 MoE), same 8-node/PP=8/EP=8 topology otherwise unchanged.
+
+**Confirmed (job 5972096): bumping layer count alone reproduces the exact
+compile-time OOM from 6r/6t/7f**, byte-for-byte -- same
+`RESOURCE_EXHAUSTED ... allocate 1.74GiB` failure at the same
+`backend_compile_and_load` call, `before_loop output size: 527.84GiB`
+(matches the original 15-layer number exactly, vs. 227.77GiB at 8 layers).
+This confirms the reasoning in `JAXPP_TE_EP_SETUP.md`'s "Known
+limitations": the OOM is driven by total unrolled MoE layer count in
+JaxPP's whole-program sharding-inference compile (which every process runs
+independently against the *full* cross-stage graph), not by node/PP
+topology -- **adding more nodes does not relieve this**, since it doesn't
+reduce total layer count. Cancelled the job immediately once confirmed
+(no need to let it actually crash).
+
+Next steps to get 15 layers working, in order of effort (mitigation menu
+from 6r, not yet attempted for real at 15 layers):
+1. Lower `TE_EP_RECV_CAPACITY_PER_RANK` further than the current 8192 --
+   cheapest, but 6t already showed this alone doesn't clear the OOM at 12
+   MoE layers (that's what motivated reducing layer count instead last
+   time) -- worth retrying in combination with other levers below, not
+   expected to be sufficient alone.
+2. Revisit `JAXPP_ENABLE_LOCAL_PROPAGATION=1` (6o/6q) -- it did eliminate
+   the OOM by replacing the whole-program compile with many small per-task
+   compiles, but hit a separate, unresolved hang (looked like a
+   whole-mesh cross-process sync fragility across many more sync points).
+   That hang was never root-caused with the same rigor as the later
+   last-step hang (7m/7n) -- worth a fresh look with `py-spy`, since that
+   technique wasn't in use yet when 6o/6q were investigated.
+3. A buffer-donation/aliasing fix in `moe.py` so XLA can reuse memory
+   across unrolled MoE layers even without a literal `scan` (mirroring
+   what `scan_layers=True` gets for free) -- most invasive, not attempted.
+
+Once 15 layers compiles and runs cleanly at 8 nodes, the follow-on step
+(separate, later config) is adding more nodes -- e.g. more PP stages
+(`dcn_pipeline_parallelism=15` for exactly 1 layer/stage, `nodes=15`) or
+wider EP -- which, per everything else validated in this investigation
+(mesh scoping, TE_EP bootstrap, NCCL communicator setup all worked cleanly
+at various topologies), is expected to be comparatively low-risk once the
+layer-count/compile-OOM problem is actually solved.
