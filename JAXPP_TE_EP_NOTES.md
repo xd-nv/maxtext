@@ -1479,3 +1479,45 @@ wider EP -- which, per everything else validated in this investigation
 (mesh scoping, TE_EP bootstrap, NCCL communicator setup all worked cleanly
 at various topologies), is expected to be comparatively low-risk once the
 layer-count/compile-OOM problem is actually solved.
+
+### 8a. CONFIRMED: JAXPP_FAST_INFER_SHARDINGS=1 fixes the compile-time OOM
+
+`jaxpp/sharding_inference.py`'s `infer_shardings` (the whole-program
+compile that was OOMing) takes `compiler_options_kvs` from
+`_fast_infer_shardings_compiler_options_kvs()` (disables
+`xla_gpu_autotune_level`, the fusion autotuner, etc.) **only if**
+`env_vars.jaxpp_fast_infer_shardings.value` is true -- and that env var
+(`JAXPP_FAST_INFER_SHARDINGS`) defaults to `False`. Every prior OOM run in
+this investigation had it unset, meaning autotuning ran fully enabled for
+that compile. Autotuning benchmarks candidate GEMM-like kernels *on the
+GPU* during compilation, allocating real device memory through the same
+`GPU_0_bfc` allocator the OOM error names -- a much more precise
+mechanism than the vague "compiler working memory" framing used earlier
+in this investigation, and one that scales with the number of distinct
+GEMM-like ops (hence with layer count), matching everything observed.
+
+Job 5994713 (`JAXPP_FAST_INFER_SHARDINGS: 1` added to
+`deepseek-v3-671b-pp8-15layer-teep.yaml`'s `env_vars`, 15 layers, 8-node
+topology otherwise unchanged) **confirms this**: `xla_compilation/
+infer_shardings` completed successfully (45.5s, no OOM at all) with
+`num_moe_layers=12`, `recv_capacity_per_rank=8192` -- the exact compile
+that OOM'd identically in every prior 15-layer attempt (6r/6t/7f/8).
+
+**A new, later, different failure surfaced past it**: a genuine *runtime*
+`RESOURCE_EXHAUSTED` (not compile-time) allocating 896.00MiB, during
+`jit_initialize_state`'s actual execution (building the initial
+parameter/optimizer state), surfaced when `get_first_step` forces
+materialization of `state.step` back to host. Confirmed
+`TE_EP_RECV_CAPACITY_PER_RANK=8192` was applied (log: "overriding ...
+266240 -> 8192"), so this isn't the same recv-buffer tuned earlier (that
+would be ~117MB now, not 896MB) -- most likely just genuine GPU memory
+pressure from materializing 12 MoE layers' worth of expert weights (256
+experts x 12 layers) instead of 5, a normal, expected consequence of more
+layers rather than a compiler-internal mystery. Not yet investigated
+further -- candidate next levers: `XLA_PYTHON_CLIENT_MEM_FRACTION` (currently
+0.88), reducing `per_device_batch_size`/microbatches again (this time for
+a legitimate memory reason, unlike 6m/6o where it didn't matter), or
+(once this specific config is stable) adding more nodes for wider EP,
+which -- unlike the compile-time OOM -- would genuinely help a real
+per-device memory shortage by sharding expert weights across more
+devices.
