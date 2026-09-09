@@ -4,21 +4,34 @@ This is a practical how-to for running DeepSeek V3 671B with TE's
 NCCL-based expert-parallel MoE (`use_te_ep`) together with JaxPP pipeline
 parallelism (`use_jaxpp`) on this branch. For the full investigation
 history, root causes, and what was tried and rejected along the way, see
-`JAXPP_TE_EP_NOTES.md` (sections 6a-7o) in this repo.
+`JAXPP_TE_EP_NOTES.md` (sections 6a-8a) in this repo.
 
 ## Status
 
-Validated end-to-end on 8 EOS nodes (H100, 64 GPUs): training runs with a
-correct, monotonically decreasing loss curve and steady-state throughput
-of ~40 TFLOP/s/device on a reduced (8-layer) smoke config. The last
-configured training step hangs on the two pipeline endpoint ranks -- see
-[Known limitations](#known-limitations) below. Everything short of that is
-working and numerically sane.
+**Validated at reduced scale.** End-to-end on 8 EOS nodes (H100, 64 GPUs):
+training runs with a correct, monotonically decreasing loss curve and
+steady-state throughput of ~40 TFLOP/s/device on an 8-layer smoke config.
+The last configured training step hangs on the two pipeline endpoint
+ranks -- see [Known limitations](#known-limitations) below. Everything
+short of that is working and numerically sane.
+
+**Blocked at the originally-targeted 15-layer scale** (and, by the same
+mechanism, at full 61-layer scale). Two distinct memory problems stack up
+as layer count grows under `scan_layers=False`:
+
+1. A compile-time OOM in JaxPP's whole-program sharding-inference compile
+   (op count scales with unrolled MoE layer count) -- **fixed**, see
+   [Known limitations](#known-limitations) item 5.
+2. A separate, genuinely-runtime OOM in `jit_initialize_state`, which does
+   **not** improve with more nodes/PP degree -- **open**, root-caused but
+   not fixed; see item 5 for why it's a real architectural gap, not a
+   config tweak.
 
 This has **not** been run at full scale (61 layers, production
 batch/microbatch counts) or validated against a `scan_layers=True`
-numerical reference. Treat it as "architecturally working, smoke-tested,"
-not "production-ready."
+numerical reference. Treat it as "architecturally working, smoke-tested at
+reduced scale," not "production-ready" and not yet "scales with more
+nodes."
 
 ## What's involved
 
@@ -96,7 +109,52 @@ mismatched pairings crash on unrelated missing symbols (see
    non-synthetic datasets -- see the docstring and the inline comment at
    that call site in `train.py` before reusing it for a real-data run.
 
-4. Not tested at full model scale, only the reduced 8-layer smoke config.
+4. Not tested at full model scale (61 layers), only the reduced 8-layer
+   smoke config and a not-yet-fully-working 15-layer attempt (see item 5).
+
+5. **Layer count is blocked at ~8 -- scaling to the original 15-layer
+   target (or full 61-layer scale) hits two stacked memory problems,**
+   both `JAXPP_TE_EP_NOTES.md` section 8/8a:
+
+   - **Compile-time OOM (fixed)**: JaxPP's whole-program sharding-inference
+     compile OOMs as unrolled MoE layer count grows -- driven by op/
+     instruction *count*, not any individual tensor's size (confirmed by
+     elimination: shrinking buffers didn't help, shrinking layer count
+     did). Root cause: that compile runs with XLA autotuning fully
+     enabled by default, which benchmarks candidate kernels *on the GPU*
+     during compilation -- real device memory allocations scaling with op
+     count. **Fix**: add `JAXPP_FAST_INFER_SHARDINGS: 1` to the config's
+     `env_vars` (disables autotuning for that specific compile). Confirmed
+     working at 15 layers (job 5994713).
+   - **Runtime OOM in `jit_initialize_state` (open, not fixed)**: once the
+     compile-time OOM is out of the way, materializing the initial
+     parameters/optimizer state OOMs for real -- and, unlike the compile
+     OOM, this **does not improve with more PP stages/nodes** (confirmed
+     identical ~99GB peak memory requirement at both PP=8 and PP=15, same
+     15-layer model). Root cause: `train_utils.py::setup_train_loop`
+     narrows the mesh to just the local pipeline stage's `EP` devices
+     *before* building the model/state (`a1a382ea`, this session's very
+     first fix, needed for `use_te_ep`'s compile to work at all under
+     jaxpp). That means state is always sharded across only the EP-sized
+     device group, regardless of PP degree -- unlike `jaxpp/dev`'s
+     reference flow, which builds state on the *full* wide mesh (so it
+     naturally scales across more devices as PP grows) and only narrows
+     right before compiling the train step.
+     **Investigated a fix, did not implement it**: matching `jaxpp/dev`'s
+     PP-scalable behavior turns out to require switching from this fork's
+     compilation pattern (plain `jax.jit` + manual `.compile()` +
+     `_local_state_to_mpmd_reshard`) to JaxPP's higher-level
+     `jaxpp.mpmd_jit_with_loop` API, which `jaxpp/dev`'s `jit_train_step`
+     actually uses and which handles the wide-state/narrow-compile
+     reconciliation internally. That's a materially bigger, higher-risk
+     rewrite than a mesh-reordering tweak -- it touches the compilation
+     strategy several other fixes this session depend on (the reshard
+     bypass, per-step reshard, metrics/profiler fixes), with real
+     potential for silently incorrect sharding if done wrong. Not
+     attempted; flagged as future work. A git tag,
+     `checkpoint-before-mesh-reorder-2026-09-08`, marks the last known-good
+     state in both this repo and `maxtext-launcher` if picking this up
+     later.
 
 ## Where to look for more detail
 
@@ -104,8 +162,13 @@ mismatched pairings crash on unrelated missing symbols (see
   investigation, including every dead end, wrong hypothesis, and the
   reasoning behind each fix. Sections 6a-6z cover getting past mesh
   scoping, the compile-time OOM, and the GEMM/quantization issue; 7a-7o
-  cover the resharding bypass and the metric-logging/hang investigation.
+  cover the resharding bypass and the metric-logging/hang investigation;
+  section 8/8a covers the 15-layer scaling attempt and both memory issues
+  above.
 - `src/maxtext/layers/te_ep_init.py::init_te_ep_for_maxtext` -- the
   `scan_layers` guard and its NOTE(jaxpp) docstring block.
 - `src/maxtext/trainers/pre_train/train.py::_local_state_to_mpmd_reshard`
   -- the reshard bypass, with its own detailed docstring.
+- `maxtext-launcher/configs/models/deepseek-v3-671b-pp8-15layer-teep.yaml`
+  and `deepseek-v3-671b-pp15-15layer-teep.yaml` -- the two configs used to
+  isolate and test the layer-scaling issues above.
