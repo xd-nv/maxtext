@@ -135,6 +135,13 @@ safe at that point; you are not losing in-flight work or corrupting
 partial results, since steps 0-6 already completed and logged before the
 hang. Don't wait for the job to self-terminate at the walltime limit.
 
+All three model configs used in this doc set `time: "00:15:00"` (rather
+than the launcher's 1hr default) for exactly this reason -- an unattended
+run hits the hang and then just burns 8-15 nodes at 100% GPU utilization
+for the rest of the walltime doing nothing useful, on shared EOS
+resources. 15 minutes comfortably covers compile (~3-4min) + the handful
+of real training steps either way.
+
 This step is here so you have a known-good reference point before looking
 at the broken case.
 
