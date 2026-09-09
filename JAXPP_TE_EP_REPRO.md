@@ -27,10 +27,28 @@ clone and must already be true of the environment you're running in:
    (17GB). It's group-readable (`coreai_devtech_all`), so anyone in that
    group can use it as-is -- no rebuild needed -- but you do need that
    group membership, and the path itself is hardcoded in each model
-   config (`container:` key), not something the clone brings with it. If
-   you're outside that group, you'll need your own copy of an equivalent
-   container and to override `container:` in the config (or via a future
-   `--container` CLI flag, which doesn't exist yet).
+   config (`container:` key), not something the clone brings with it.
+
+   Since this lives on shared Lustre, a colleague who already has
+   `coreai_devtech_all` group membership (the same group needed for SLURM
+   access below) needs **nothing extra** -- the path just resolves.
+   Confirm with:
+   ```bash
+   groups | tr ' ' '\n' | grep coreai_devtech_all
+   ls -la /lustre/fsw/coreai_devtech_all/xiningd/amazon_fmr_containers/ghcr_nvidia_jax_maxtext_nightly_f07a860_pr3083_30743e4_sm90_v2_20260812.sqsh
+   ```
+   If they're **not** in that group, there's no clean self-service fix:
+   this specific `.sqsh` is a hand-built nightly image with a TE overlay
+   pairing baked in (must match `te_overlay_jaxpp`'s baseline, see
+   `JAXPP_TE_EP_NOTES.md` 6e) and there's no documented `docker build`/
+   `enroot import` recipe to reproduce this exact tag from scratch. The
+   practical options are: ask whoever manages `coreai_devtech_all` group
+   membership to add them, or have someone who already has access `cp`/
+   `rsync` the 17GB file to a Lustre path they can read. (Overriding
+   `container:` in the config to point at a different image is also
+   possible, but only if you're confident that image's TE build actually
+   matches `te_overlay_jaxpp` -- mismatched pairings crash on unrelated
+   missing symbols, `JAXPP_TE_EP_NOTES.md` 6d.)
 2. **SLURM account/partition access.** `maxtext-launcher/configs/
    defaults.yaml` hardcodes `account: coreai_devtech_all` and
    `partition: 36x2-a01r`. You need SLURM allocation rights under that
