@@ -40,12 +40,22 @@ git clone -b add-jaxpp-pp-support ssh://git@gitlab-master.nvidia.com:12051/xinin
 #   cd maxtext-te-ep-v2-xiaopo && git submodule update --init --recursive
 ```
 
+The two clones above land side by side in one parent folder. All the
+`launcher.py` commands below use that layout via
+`--te-overlay-dir "$(cd ../maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp && pwd)"`
+run from inside `maxtext-launcher` -- this must be an **absolute** path
+(`launcher.py` does `Path(te_overlay_dir).relative_to(workspace_base)` to
+decide the in-container mount point, so a relative path resolves against
+the wrong base). The `$(cd ... && pwd)` idiom turns the relative,
+same-parent-folder path into an absolute one at the moment you run the
+command, without hand-typing your actual clone location.
+
 ## Step 1: reproduce the working baseline (8 layers)
 
 ```bash
 cd maxtext-launcher
 python3 launcher.py deepseek-v3-671b-pp8-15layer-smoke-teep --cluster eos --tag repro-baseline \
-  --te-overlay-dir /path/to/maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp
+  --te-overlay-dir "$(cd ../maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp && pwd)"
 ```
 
 8 nodes, PP=8 x EP=8, 8 decoder layers (3 dense + 5 MoE). Expect steps 0-6
@@ -63,7 +73,7 @@ at the broken case.
 
 ```bash
 python3 launcher.py deepseek-v3-671b-pp8-15layer-teep --cluster eos --tag repro-compile-oom \
-  --te-overlay-dir /path/to/maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp
+  --te-overlay-dir "$(cd ../maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp && pwd)"
 ```
 
 Same 8-node/PP=8/EP=8 topology, `base_num_decoder_layers: 15` (3 dense +
@@ -103,7 +113,7 @@ This happens while actually materializing the model's initial parameters
 
 ```bash
 python3 launcher.py deepseek-v3-671b-pp15-15layer-teep --cluster eos --tag repro-pp15 \
-  --te-overlay-dir /path/to/maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp
+  --te-overlay-dir "$(cd ../maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp && pwd)"
 ```
 
 This is the *same* 15-layer model, but `dcn_pipeline_parallelism: 15` /
