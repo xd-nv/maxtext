@@ -110,9 +110,30 @@ python3 launcher.py deepseek-v3-671b-pp8-15layer-smoke-teep --cluster eos --tag 
 to complete with a real, monotonically decreasing loss and steady-state
 throughput around 40 TFLOP/s/device; step 7 (the last configured step)
 hangs on the two pipeline endpoint ranks -- a separate, already-understood
-issue (`JAXPP_TE_EP_NOTES.md` 7m/7n), not what this doc is about. Either
-let it run and read the metrics from the earlier steps, or cancel once
-you've seen enough.
+issue, not what this doc is about.
+
+**What the hang looks like, so it doesn't read as a crash**: `squeue`
+still shows the job `RUNNING` (it is not stuck in a SLURM sense), rank 0's
+and the last rank's per-rank logs (`outputs/<tag>_<timestamp>/output-
+<jobid>-<node>-<rank>.txt`) stop after `completed step: 6` and never print
+`completed step: 7`, and `nvidia-smi` on those two nodes shows the GPUs
+still at **100% utilization** -- i.e. it's not idle/frozen, it's actively
+spinning on some device-side op (most likely a JaxPP-scheduler-internal
+NCCL collective at the pipeline's terminal/drain iteration) that never
+returns. All the *other* ranks (every non-endpoint pipeline stage) do
+print `completed step: 7` normally and exit cleanly -- only the two
+endpoint stages (global rank 0 and the last global rank) get stuck. This
+was confirmed live via `py-spy dump --pid <pid>` on both stuck ranks,
+both sitting in `metric_logger.py`'s `_log_training_metrics` -> jax
+`Array.__format__` -> `_value`, i.e. blocked materializing a metric value
+whose underlying device computation never completes.
+
+**How to handle it without confusion**: once you see `completed step: 6`
+on every rank's log and no further step lines appear for a minute or two,
+the run has given you everything it's going to -- `scancel <jobid>` is
+safe at that point; you are not losing in-flight work or corrupting
+partial results, since steps 0-6 already completed and logged before the
+hang. Don't wait for the job to self-terminate at the walltime limit.
 
 This step is here so you have a known-good reference point before looking
 at the broken case.

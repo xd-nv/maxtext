@@ -86,10 +86,23 @@ mismatched pairings crash on unrelated missing symbols (see
    device-side async computation for one metric value on the two pipeline
    endpoint stages (rank 0 and the last rank) -- not a crash, not a
    training-correctness issue (loss is already correct and decreasing by
-   the time it happens). Looks like a JaxPP scheduling edge case for
-   terminal-iteration draining at pipeline boundaries; not something
-   fixable from this integration layer. Workaround: run a couple of extra
-   steps beyond what you need and don't wait for/depend on the final one.
+   the time it happens). All non-endpoint pipeline stages complete the
+   final step and exit cleanly; only the two endpoint stages get stuck.
+   Confirmed live (job 6000960, 2026-09-09) that this is an active spin,
+   not an idle wait: `nvidia-smi` on the two stuck nodes shows their GPUs
+   at 100% utilization the whole time, while `py-spy` shows the host
+   thread blocked in `metric_logger.py`'s `_log_training_metrics` ->
+   `Array.__format__` -> `_value`, waiting on that device computation to
+   finish. Points at a stuck kernel/NCCL collective inside JaxPP's own
+   scheduler at the terminal/drain iteration, not something fixable from
+   this integration layer -- root-causing exactly which call is stuck
+   would need `NCCL_DEBUG=INFO` or an `nsys` capture on the two endpoint
+   ranks while it's spinning; not yet attempted. Workaround: this is safe
+   to work around, not just tolerate -- `squeue` still shows the job
+   `RUNNING` and every earlier step's data is already fully logged before
+   the hang, so once `completed step: N-1` appears on every rank's log and
+   no further step lines show up for a minute or two, `scancel` the job
+   rather than waiting for the walltime limit.
 
 2. **`scan_layers=False` + `use_te_ep` numerical correctness is inferred,
    not verified.** The `scan_layers=True` requirement was relaxed to a
