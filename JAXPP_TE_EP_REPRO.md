@@ -27,6 +27,11 @@ pipeline stages/nodes. That's the part worth a second pair of eyes.
   same tag name.
 
 ```bash
+# Pick any empty parent directory -- these steps don't depend on its name
+# or location, only that both repos land side by side inside it.
+mkdir -p jaxpp-repro && cd jaxpp-repro
+REPO_ROOT="$(pwd)"
+
 # --recurse-submodules is required: third_party/jaxpp is a git submodule
 # (pinned at mlsys2025-476-gc65f75e) and the launcher installs jaxpp from
 # it directly (`pip install --no-deps -e "$maxtext_path/third_party/jaxpp"`,
@@ -40,22 +45,31 @@ git clone -b add-jaxpp-pp-support ssh://git@gitlab-master.nvidia.com:12051/xinin
 #   cd maxtext-te-ep-v2-xiaopo && git submodule update --init --recursive
 ```
 
-The two clones above land side by side in one parent folder. All the
-`launcher.py` commands below use that layout via
-`--te-overlay-dir "$(cd ../maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp && pwd)"`
-run from inside `maxtext-launcher` -- this must be an **absolute** path
-(`launcher.py` does `Path(te_overlay_dir).relative_to(workspace_base)` to
-decide the in-container mount point, so a relative path resolves against
-the wrong base). The `$(cd ... && pwd)` idiom turns the relative,
-same-parent-folder path into an absolute one at the moment you run the
-command, without hand-typing your actual clone location.
+Every `launcher.py` command below passes `--workspace "$REPO_ROOT"` and
+`--te-overlay-dir "$REPO_ROOT/maxtext-te-ep-v2-xiaopo/src/maxtext/
+te_overlay_jaxpp"`, both **absolute**, explicitly overriding whatever
+`workspace:`/`maxtext_path:` the model config hardcodes. This is what
+makes the steps location-independent -- without it, the model configs'
+own `workspace: /lustre/fsw/coreai_devtech_all/xiningd/jax` gets bind-
+mounted as `/opt/workspace` regardless of where you actually cloned, and
+`maxtext_path: /opt/workspace/maxtext-te-ep-v2-xiaopo` silently resolves
+inside *that* directory -- so if you clone anywhere else, the job runs
+against whatever checkout (if any) happens to sit at that hardcoded path,
+not the one you just made, and fails confusingly or silently trains the
+wrong code. (`--maxtext-path` is also available if your checkout isn't
+named `maxtext-te-ep-v2-xiaopo` directly under `$REPO_ROOT`; not needed
+here since the clone command above uses that exact name.) Both
+`--workspace` and `--maxtext-path` require the `add-jaxpp-pp-support`
+branch of `maxtext-launcher` used above -- they were added specifically
+to make this doc self-contained.
 
 ## Step 1: reproduce the working baseline (8 layers)
 
 ```bash
-cd maxtext-launcher
+cd "$REPO_ROOT/maxtext-launcher"
 python3 launcher.py deepseek-v3-671b-pp8-15layer-smoke-teep --cluster eos --tag repro-baseline \
-  --te-overlay-dir "$(cd ../maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp && pwd)"
+  --workspace "$REPO_ROOT" \
+  --te-overlay-dir "$REPO_ROOT/maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp"
 ```
 
 8 nodes, PP=8 x EP=8, 8 decoder layers (3 dense + 5 MoE). Expect steps 0-6
@@ -73,7 +87,8 @@ at the broken case.
 
 ```bash
 python3 launcher.py deepseek-v3-671b-pp8-15layer-teep --cluster eos --tag repro-compile-oom \
-  --te-overlay-dir "$(cd ../maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp && pwd)"
+  --workspace "$REPO_ROOT" \
+  --te-overlay-dir "$REPO_ROOT/maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp"
 ```
 
 Same 8-node/PP=8/EP=8 topology, `base_num_decoder_layers: 15` (3 dense +
@@ -113,7 +128,8 @@ This happens while actually materializing the model's initial parameters
 
 ```bash
 python3 launcher.py deepseek-v3-671b-pp15-15layer-teep --cluster eos --tag repro-pp15 \
-  --te-overlay-dir "$(cd ../maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp && pwd)"
+  --workspace "$REPO_ROOT" \
+  --te-overlay-dir "$REPO_ROOT/maxtext-te-ep-v2-xiaopo/src/maxtext/te_overlay_jaxpp"
 ```
 
 This is the *same* 15-layer model, but `dcn_pipeline_parallelism: 15` /
