@@ -16,6 +16,40 @@ open: a real, runtime out-of-memory error building the model's initial
 parameters, which -- surprisingly -- does not improve when adding more
 pipeline stages/nodes. That's the part worth a second pair of eyes.
 
+## Prerequisites
+
+Beyond the two `git clone`s below, three things are *not* carried by the
+clone and must already be true of the environment you're running in:
+
+1. **The container image.** Model configs reference a pre-built `.sqsh`
+   file by absolute path:
+   `/lustre/fsw/coreai_devtech_all/xiningd/amazon_fmr_containers/ghcr_nvidia_jax_maxtext_nightly_f07a860_pr3083_30743e4_sm90_v2_20260812.sqsh`
+   (17GB). It's group-readable (`coreai_devtech_all`), so anyone in that
+   group can use it as-is -- no rebuild needed -- but you do need that
+   group membership, and the path itself is hardcoded in each model
+   config (`container:` key), not something the clone brings with it. If
+   you're outside that group, you'll need your own copy of an equivalent
+   container and to override `container:` in the config (or via a future
+   `--container` CLI flag, which doesn't exist yet).
+2. **SLURM account/partition access.** `maxtext-launcher/configs/
+   defaults.yaml` hardcodes `account: coreai_devtech_all` and
+   `partition: 36x2-a01r`. You need SLURM allocation rights under that
+   account on EOS (or override `--partition`/`account` on the CLI for a
+   different one you do have access to).
+3. **A Python env with `pyyaml` for `launcher.py` itself** -- it runs on
+   the login node, outside the container, just to render and submit the
+   SLURM scripts.
+
+No dataset staging or HF token is needed -- every config here uses
+`dataset_type: synthetic`.
+
+The output directory (`$REPO_ROOT/outputs/<tag>_<timestamp>/`, holding
+logs, `run.sh`, `submit.sh`, `config.yaml`) is **not** separately
+hardcoded -- `launcher.py` derives it directly from `workspace`
+(`output_dir = f"{workspace}/outputs/{tag}_{timestamp}"`), so passing
+`--workspace "$REPO_ROOT"` as shown below automatically puts outputs
+under your own clone location too.
+
 ## Where the code is
 
 - `maxtext-te-ep-v2-xiaopo`, branch `te-pr3429-nested-gemm-0826_jaxpp`,
