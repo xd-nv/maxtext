@@ -27,8 +27,17 @@ pipeline stages/nodes. That's the part worth a second pair of eyes.
   same tag name.
 
 ```bash
-git clone -b te-pr3429-nested-gemm-0826_jaxpp git@github.com:xd-nv/maxtext.git maxtext-te-ep-v2-xiaopo
+# --recurse-submodules is required: third_party/jaxpp is a git submodule
+# (pinned at mlsys2025-476-gc65f75e) and the launcher installs jaxpp from
+# it directly (`pip install --no-deps -e "$maxtext_path/third_party/jaxpp"`,
+# maxtext-launcher/templates/run.template.sh) -- an empty checkout there
+# breaks the job at container startup, not at some obvious "missing repo"
+# clone step.
+git clone --recurse-submodules -b te-pr3429-nested-gemm-0826_jaxpp git@github.com:xd-nv/maxtext.git maxtext-te-ep-v2-xiaopo
 git clone -b add-jaxpp-pp-support ssh://git@gitlab-master.nvidia.com:12051/xiningd/maxtext-launcher.git
+
+# If you already cloned without --recurse-submodules, fix it up in place:
+#   cd maxtext-te-ep-v2-xiaopo && git submodule update --init --recursive
 ```
 
 ## Step 1: reproduce the working baseline (8 layers)
