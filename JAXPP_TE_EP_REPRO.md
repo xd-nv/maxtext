@@ -49,6 +49,24 @@ clone and must already be true of the environment you're running in:
    possible, but only if you're confident that image's TE build actually
    matches `te_overlay_jaxpp` -- mismatched pairings crash on unrelated
    missing symbols, `JAXPP_TE_EP_NOTES.md` 6d.)
+
+   For reference, the TE baked into this exact container: `transformer_engine
+   2.19.0.dev0+f07a8602`, installed editable from `/opt/transformer-engine`
+   inside the image (`pip show transformer_engine` or the `.dist-info`
+   directory under `/usr/local/lib/python3.12/dist-packages/` will confirm
+   this from inside a running job). The `f07a8602` local-version suffix is
+   the source commit it was built from -- also embedded in the container's
+   own filename (`..._f07a860_...`) -- but that commit isn't present in
+   either of this team's usual local TE checkouts (gitlab
+   `phuonguyen/transformerengine` or github `NVIDIA/TransformerEngine`), so
+   don't assume you can `git checkout` it locally to diff against; treat the
+   container's installed copy as the source of truth instead.
+
+   **There is no separate TE repo to clone or prepare for this walkthrough.**
+   The only TE-side change involved is `te_overlay_jaxpp/`, and it's already
+   committed inside this repo (confirmed to be a straight copy of the
+   existing `te_overlay/`, not a separate checkout) -- it ships with the
+   `maxtext-te-ep-v2-xiaopo` clone below and needs nothing extra.
 2. **SLURM account/partition access.** `maxtext-launcher/configs/
    defaults.yaml` hardcodes `account: coreai_devtech_all` and
    `partition: 36x2-a01r`. You need SLURM allocation rights under that
@@ -72,11 +90,17 @@ under your own clone location too.
 
 - `maxtext-te-ep-v2-xiaopo`, branch `te-pr3429-nested-gemm-0826_jaxpp`,
   pushed to `git@github.com:xd-nv/maxtext.git`. Tag
-  `checkpoint-before-mesh-reorder-2026-09-08` marks the current state (all
-  the reproduction steps below are unchanged since that tag).
+  `jaxpp-te-ep-preview-2026-09-11` marks the exact state this doc describes
+  -- clone/checkout that tag if you want to be certain you're looking at
+  precisely what's documented here rather than whatever the branch has
+  moved to since. (An earlier tag, `checkpoint-before-mesh-reorder-2026-09-08`,
+  is now stale relative to this doc -- several rounds of self-containment
+  and clarification fixes landed after it; it's kept only as a pointer back
+  to the investigation state referenced in `JAXPP_TE_EP_SETUP.md`'s "Known
+  limitations" section.)
 - `maxtext-launcher`, branch `add-jaxpp-pp-support`, pushed to
   `ssh://gitlab-master.nvidia.com:12051/xiningd/maxtext-launcher.git`,
-  same tag name.
+  same tag name (`jaxpp-te-ep-preview-2026-09-11`).
 
 ```bash
 # Pick any empty parent directory -- these steps don't depend on its name
